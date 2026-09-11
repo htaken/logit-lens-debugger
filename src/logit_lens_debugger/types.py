@@ -550,19 +550,97 @@ class AnomalyReport:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
+@dataclass(frozen=True)
+class LayerComparison:
+    """Comparison of one pair of (aligned) layers between two lens runs.
+
+    ``layer_a``/``layer_b`` are the raw layer indices being compared (equal in
+    "prompt" mode; may differ once model comparison, kind="model", aligns layers
+    by relative depth). ``kl_a_b``/``kl_b_a``/``js`` are ``None`` whenever a full
+    vocabulary distribution was not kept for both sides (see :mod:`.comparison`).
+    """
+
+    layer_a: int
+    layer_b: int
+    top1_same: bool
+    topk_overlap: float
+    kl_a_b: float | None
+    kl_b_a: float | None
+    js: float | None
+    target_rank_a: int | None
+    target_rank_b: int | None
+    target_prob_a: float | None
+    target_prob_b: float | None
+    target_rank_log_delta: float | None
+    target_logprob_delta: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> LayerComparison:
+        return cls(**data)
+
+
 @dataclass
 class ComparisonResult:
-    """Layer-wise comparison of two lens runs (e.g. prompt A vs prompt B)."""
+    """Layer-wise comparison of two lens runs (e.g. prompt A vs prompt B).
+
+    ``layers``/``alignment`` are the machinery added for the extended comparison
+    (see :mod:`.comparison`): ``alignment[i] == (layers[i].layer_a, layers[i].layer_b)``,
+    identity in "prompt" mode (``kind == "prompt"``). ``top1_agreement`` and
+    ``divergence_layers`` refer to entry ``i`` of ``alignment``/``layers``, so their
+    semantics are unchanged from before this field existed.
+    """
 
     result_a: LogitLensResult
     result_b: LogitLensResult
     top1_agreement: list[bool]
     first_divergence_layer: int | None
     last_divergence_layer: int | None
+    layers: list[LayerComparison] = field(default_factory=list)
+    alignment: list[tuple[int, int]] = field(default_factory=list)
+    kind: str = "prompt"
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def divergence_layers(self) -> list[int]:
         return [i for i, same in enumerate(self.top1_agreement) if not same]
+
+    def first_layer_kl_above(self, threshold: float, direction: str = "js") -> int | None:
+        """``layer_a`` of the first :class:`LayerComparison` whose divergence >= threshold.
+
+        ``direction`` selects which value is checked: ``"a_b"`` (``kl_a_b``),
+        ``"b_a"`` (``kl_b_a``), ``"js"`` (default) or ``"max"`` (the larger of
+        ``kl_a_b``/``kl_b_a``). Returns ``None`` if no layer has that distribution
+        available, or if none ever reaches ``threshold``.
+        """
+        if direction not in {"a_b", "b_a", "js", "max"}:
+            raise ValueError(f"direction must be one of a_b/b_a/js/max, got {direction!r}")
+        for lc in self.layers:
+            if direction == "a_b":
+                value = lc.kl_a_b
+            elif direction == "b_a":
+                value = lc.kl_b_a
+            elif direction == "js":
+                value = lc.js
+            else:
+                candidates = [v for v in (lc.kl_a_b, lc.kl_b_a) if v is not None]
+                value = max(candidates) if candidates else None
+            if value is not None and value >= threshold:
+                return lc.layer_a
+        return None
+
+    def first_layer_target_rank_differs(self) -> int | None:
+        """``layer_a`` of the first layer where both target ranks are known and differ."""
+        for lc in self.layers:
+            if (
+                lc.target_rank_a is not None
+                and lc.target_rank_b is not None
+                and lc.target_rank_a != lc.target_rank_b
+            ):
+                return lc.layer_a
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -571,6 +649,10 @@ class ComparisonResult:
             "top1_agreement": list(self.top1_agreement),
             "first_divergence_layer": self.first_divergence_layer,
             "last_divergence_layer": self.last_divergence_layer,
+            "layers": [lc.to_dict() for lc in self.layers],
+            "alignment": [list(pair) for pair in self.alignment],
+            "kind": self.kind,
+            "metadata": dict(self.metadata),
         }
 
     def to_json(self, indent: int | None = 2) -> str:
@@ -581,3 +663,21 @@ class ComparisonResult:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.to_json(), encoding="utf-8")
         return path
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ComparisonResult:
+        return cls(
+            result_a=LogitLensResult.from_dict(data["result_a"]),
+            result_b=LogitLensResult.from_dict(data["result_b"]),
+            top1_agreement=list(data["top1_agreement"]),
+            first_divergence_layer=data.get("first_divergence_layer"),
+            last_divergence_layer=data.get("last_divergence_layer"),
+            layers=[LayerComparison.from_dict(lc) for lc in data.get("layers", [])],
+            alignment=[tuple(pair) for pair in data.get("alignment", [])],
+            kind=data.get("kind", "prompt"),
+            metadata=dict(data.get("metadata", {})),
+        )
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> ComparisonResult:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))

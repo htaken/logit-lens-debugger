@@ -46,7 +46,7 @@ layer 24  → ' Tokyo'   p=0.72   ← 最終 layer = モデルの実際の出力
 - 指定した token position の residual stream を、各 layer 時点で語彙空間に射影したときの top-k token とその token id / logit / probability / rank
 - 追跡対象 token（target）の各 layer における rank と probability
 - 各 layer の分布のエントロピー（confidence の目安）
-- 2 つのテキスト間で top-1 予測が分岐し始める layer（`compare`）
+- 2 つのテキスト間の layer ごとの比較（`compare`）: top-1 一致・top-k 集合の Jaccard overlap・KL / Jensen-Shannon divergence（全語彙分布ベース）・共通 target token の rank / probability の差
 
 **解析していないもの・注意点**
 
@@ -138,11 +138,26 @@ Top-1 trajectory (final-norm lens) for the token after index 10 ':'
 その他のコマンド:
 
 ```bash
-# 2 つのテキストで top-1 予測が分岐する layer を調べる
+# 2 つのテキストを layer ごとに比較する（top-1 一致・top-k overlap・KL/JS・target rank）
 uv run logit-lens compare --model Qwen/Qwen2.5-0.5B \
   --text-a $'Q: What is the capital of Japan?\nA:' \
-  --text-b $'Q: What is the capital of France?\nA:'
+  --text-b $'Q: What is the capital of France?\nA:' \
+  --kl-threshold 0.2 --json outputs/cmp.json --html outputs/cmp.html
+```
 
+```
+layer  A top-1 (p)                B top-1 (p)                same  overlap   KL(A‖B)   KL(B‖A)       JS  target rank A->B
+    0  ' __'                (0.010)  ' __'                (0.010)  yes     1.000    0.0000    0.0000   0.0000  -
+   12  ' Tokyo'              (0.340)  ' France'             (0.210)  NO      0.400    1.8300    1.5200   0.6100  -
+   24  ' Tokyo'              (0.720)  ' Paris'              (0.680)  NO      0.100    3.9000    3.7000   0.6900  -
+
+Top-1 first diverges at layer 9, last differs at layer 24 (14 of 25 layers differ).
+JS first >= 0.2 at layer 9.
+```
+
+`--no-kl` を付けると KL/JS 列は `-` になり（全語彙分布を保持しないため計算コストがゼロになる）、フッタは `JS first >= ...: no distributions.` になります。`--json` は拡張された `ComparisonResult`（`layers` / `alignment` / `kind` / `metadata` を含む）を保存し、`--html` は layer ごとの KL/JS 折れ線と top-1 分岐位置のマーカーを描画します。
+
+```bash
 # 保存済み JSON からモデルをロードせずに可視化を再生成する
 uv run logit-lens visualize outputs/qa.json --html outputs/qa_heatmap.html --kind heatmap
 uv run logit-lens visualize outputs/qa.json --html outputs/qa_traj.html --kind trajectory
@@ -235,11 +250,41 @@ analyzer.analyze(text, token_index=-2, target_token=" Osaka")
 #### 2 つのテキストの比較
 
 ```python
-cmp = analyzer.compare(text_a, text_b, token_index=-1, top_k=10)
+cmp = analyzer.compare(
+    text_a, text_b,
+    token_index=-1,        # text_a の position（負数は末尾から）
+    token_index_b=None,    # text_b の position。省略時は token_index と同じ
+    top_k=10,
+    target_token=None,     # 両方のテキストで共通に追跡する token（省略時は各テキストの次 token）
+    keep_log_probs=True,   # KL / JS 計算用に全語彙分布を保持する（既定 on）
+)
+
 cmp.top1_agreement          # layer ごとに top-1 が一致したか (list[bool])
 cmp.first_divergence_layer  # 最初に分岐した layer（None なら全 layer 一致）
 cmp.divergence_layers       # 分岐した layer の一覧
+cmp.kind                    # "prompt"（機能 5 の model comparison では "model"）
+cmp.alignment                # [(layer_a, layer_b), ...]  prompt モードでは恒等対応
 ```
+
+`cmp.layers[i]`（`LayerComparison`、`alignment[i]` に対応）には layer ごとの詳細指標が入ります。
+
+```python
+lc = cmp.layers[10]
+lc.layer_a, lc.layer_b     # 比較した layer index（prompt モードでは同じ値）
+lc.top1_same                # 既存の top-1 一致
+lc.topk_overlap              # top-k 集合の Jaccard 係数
+lc.kl_a_b, lc.kl_b_a, lc.js  # KL(A‖B) / KL(B‖A) / Jensen-Shannon divergence（自然対数）。
+                             # keep_log_probs=False や JSON から復元した結果では None
+lc.target_rank_a, lc.target_rank_b        # 共通 target の rank
+lc.target_prob_a, lc.target_prob_b        # 共通 target の probability
+lc.target_rank_log_delta    # log2(rank_b) - log2(rank_a)
+lc.target_logprob_delta     # ln(p_b) - ln(p_a)
+
+cmp.first_layer_kl_above(0.1, direction="js")   # JS が閾値を超える最初の layer（direction: a_b/b_a/js/max）
+cmp.first_layer_target_rank_differs()           # 共通 target の rank が最初に食い違う layer
+```
+
+`keep_log_probs=True`（既定）は 1 position あたり `(層数+1) × vocab_size` の float32 を CPU に保持します。Qwen2.5-0.5B（25 層、vocab 151936）なら約 15 MB で、`compare()` が返る前に解放されるので実害はありません。KL/JS が不要なら `keep_log_probs=False` を渡すと、その分の計算とメモリ確保自体を省けます（`lc.kl_a_b` などは `None` になります）。
 
 #### Layer instability（予測の不安定さ）
 
@@ -513,7 +558,7 @@ Hugging Face Transformers
 
 | ファイル | 役割 |
 |---|---|
-| `src/logit_lens_debugger/types.py` | `TokenPrediction` / `LayerResult` / `LogitLensResult` / `ComparisonResult` / `LensMode`（dataclass、JSON 往復可） |
+| `src/logit_lens_debugger/types.py` | `TokenPrediction` / `LayerResult` / `LogitLensResult` / `ComparisonResult` / `LayerComparison` / `LensMode`（dataclass、JSON 往復可） |
 | `src/logit_lens_debugger/adapters/base.py` | `ModelAdapter` ABC と `HFCausalLMAdapter`、device / dtype 解決 |
 | `src/logit_lens_debugger/adapters/qwen.py`, `llama.py` | ファミリー別 adapter（`supported_model_types` を宣言） |
 | `src/logit_lens_debugger/adapters/registry.py` | `config.model_type` → adapter の解決、`load_adapter` / `register_adapter` |
@@ -522,7 +567,9 @@ Hugging Face Transformers
 | `src/logit_lens_debugger/metrics.py` | `compute_instability()` → `InstabilityMetrics`（torch 非依存、JSON からも計算可） |
 | `src/logit_lens_debugger/diff.py` | `diff_token_sequences()` / `select_positions()` / `token_class()`（torch 非依存、diff から対象 position を選ぶ） |
 | `src/logit_lens_debugger/anomaly.py` | `score_position()` / `detect_anomalies()` → `AnomalyReport`（torch 非依存、diff / instability を合成して token をスコアリング） |
-| `src/logit_lens_debugger/visualization/` | ヒートマップ・trajectory（Plotly）とテキスト整形 |
+| `src/logit_lens_debugger/comparison.py` | `compare_results()` / `compare_layer()` / KL・JS divergence / `topk_overlap()`（`analyzer.compare()` の実体。KL/JS のみ torch 使用） |
+| `src/logit_lens_debugger/visualization/` | ヒートマップ・trajectory・comparison（Plotly）とテキスト整形 |
+| `src/logit_lens_debugger/visualization/comparison.py` | `format_comparison()`（テキスト表）と `build_comparison_figure()` / `export_comparison_html()`（layer ごとの KL/JS 折れ線） |
 | `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `diff` / `scan` / `metrics` / `visualize`） |
 | `tests/` | 極小ランダム初期化モデルによるオフラインテスト + opt-in の実モデル統合テスト |
 | `examples/basic_analysis.py` | API の最小サンプル |
@@ -585,7 +632,7 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 1. ~~Input / Output diff → 対象 position の自動選択~~ → 実装済み（`diff.py`、`analyzer.analyze_diff()` / `analyze_generation()` / `analyze_positions()`、CLI `diff` コマンド）
 2. ~~自動 anomaly detection~~ → 実装済み（`anomaly.py`、`analyzer.detect_anomalies()`、CLI `scan` コマンド）
 3. ~~Layer instability スコア~~ → 実装済み（`metrics.py`）
-4. **Prompt comparison の拡張**（9.4）: `compare()` を position 対応付け付きに拡張し、top-1 一致だけでなく layer ごとの KL divergence や target rank 差を出す。
+4. ~~Prompt comparison の拡張~~ → 実装済み（`comparison.py`、`analyzer.compare()` に `token_index_b` / KL・JS / top-k overlap / target rank 差、CLI `compare` の拡張オプション）
 5. **Model comparison**（9.5）: 2 つの `LogitLensAnalyzer` の結果を同じ `ComparisonResult` 形式で並べる。
 6. **chat template オプション**、**tuned lens**、**batch 対応**。
 

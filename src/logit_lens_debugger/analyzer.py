@@ -12,6 +12,7 @@ import torch
 from .adapters.base import ModelAdapter
 from .adapters.registry import load_adapter
 from .anomaly import detect_anomalies as _score_anomalies
+from .comparison import compare_results
 from .diff import diff_token_sequences, select_positions
 from .engine import LogitLensEngine
 from .types import (
@@ -90,6 +91,23 @@ class LogitLensAnalyzer:
         reported. To ask why the model produced the token at position ``j``,
         analyze ``token_index=j - 1``.
         """
+        result, _ = self._analyze_detailed(text, token_index, top_k, target_token)
+        return result
+
+    def _analyze_detailed(
+        self,
+        text: str,
+        token_index: int = -1,
+        top_k: int = 10,
+        target_token: str | int | None = None,
+        keep_log_probs: bool = False,
+    ) -> tuple[LogitLensResult, torch.Tensor | None]:
+        """Shared body of :meth:`analyze` and :meth:`compare`.
+
+        Returns the usual :class:`LogitLensResult` plus, when ``keep_log_probs``,
+        the full-vocabulary log-probabilities from :meth:`~.engine.LogitLensEngine.run_detailed`
+        (``[num_layers + 1, 1, V]``, one position) -- ``None`` otherwise.
+        """
         input_ids = self.adapter.tokenize(text)
         ids: list[int] = input_ids[0].tolist()
         position = normalize_index(token_index, len(ids))
@@ -101,8 +119,14 @@ class LogitLensAnalyzer:
         else:
             target_id = None
 
-        layers = self.engine.run(input_ids, [position], top_k=top_k, target_token_id=target_id)[0]
-        return LogitLensResult(
+        output = self.engine.run_detailed(
+            input_ids,
+            [position],
+            top_k=top_k,
+            target_token_id=target_id,
+            keep_log_probs=keep_log_probs,
+        )
+        result = LogitLensResult(
             model_name=self.model_name,
             lens_mode=self.lens_mode,
             text=text,
@@ -110,11 +134,12 @@ class LogitLensAnalyzer:
             input_token_ids=ids,
             token_index=position,
             top_k=top_k,
-            layers=layers,
+            layers=output.layers[0],
             target_token=self.adapter.decode_token(target_id) if target_id is not None else None,
             target_token_id=target_id,
             metadata={"device": str(self.adapter.device), "vocab_size": self.adapter.vocab_size},
         )
+        return result, output.log_probs
 
     def _resolve_target(self, target_token: str | int) -> int:
         if isinstance(target_token, int):
@@ -408,27 +433,51 @@ class LogitLensAnalyzer:
         token_index: int = -1,
         top_k: int = 10,
         target_token: str | int | None = None,
+        token_index_b: int | None = None,
+        keep_log_probs: bool = True,
     ) -> ComparisonResult:
-        """Run the lens on two texts at the same (relative) position and locate divergence.
+        """Run the lens on two texts and compare layer-wise: top-1, KL/JS, overlap, target rank.
 
-        Divergence is measured on the top-1 token per layer. This is the seed
-        for the planned prompt-comparison feature.
+        ``token_index_b`` (default: same as ``token_index``) lets the two texts be
+        probed at different positions -- useful when they have different lengths but
+        both should be read from the end (``token_index=token_index_b=-1``, the
+        default). ``target_token``, if given, is resolved once and tracked in both
+        texts; otherwise each text tracks its own following token, as in
+        :meth:`analyze`.
+
+        With ``keep_log_probs`` (default ``True``), the full-vocabulary
+        log-probabilities for the compared position are kept just long enough to
+        compute ``cmp.layers[i].kl_a_b`` / ``.kl_b_a`` / ``.js`` -- one position costs
+        ``(num_layers + 1) * vocab_size`` float32 values per text (~15 MB for
+        Qwen2.5-0.5B); pass ``False`` to skip this and get ``None`` for those fields.
         """
-        result_a = self.analyze(
-            text_a, token_index=token_index, top_k=top_k, target_token=target_token
+        if token_index_b is None:
+            token_index_b = token_index
+
+        result_a, log_probs_a = self._analyze_detailed(
+            text_a,
+            token_index=token_index,
+            top_k=top_k,
+            target_token=target_token,
+            keep_log_probs=keep_log_probs,
         )
-        result_b = self.analyze(
-            text_b, token_index=token_index, top_k=top_k, target_token=target_token
+        result_b, log_probs_b = self._analyze_detailed(
+            text_b,
+            token_index=token_index_b,
+            top_k=top_k,
+            target_token=target_token,
+            keep_log_probs=keep_log_probs,
         )
-        agreement = [
-            la.top1.token_id == lb.top1.token_id
-            for la, lb in zip(result_a.layers, result_b.layers, strict=True)
-        ]
-        diverged = [i for i, same in enumerate(agreement) if not same]
-        return ComparisonResult(
-            result_a=result_a,
-            result_b=result_b,
-            top1_agreement=agreement,
-            first_divergence_layer=diverged[0] if diverged else None,
-            last_divergence_layer=diverged[-1] if diverged else None,
+        if log_probs_a is not None:
+            log_probs_a = log_probs_a[:, 0, :]
+        if log_probs_b is not None:
+            log_probs_b = log_probs_b[:, 0, :]
+
+        return compare_results(
+            result_a,
+            result_b,
+            log_probs_a=log_probs_a,
+            log_probs_b=log_probs_b,
+            kind="prompt",
+            metadata={"device": str(self.adapter.device), "keep_log_probs": keep_log_probs},
         )

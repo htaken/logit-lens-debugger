@@ -100,9 +100,79 @@ def test_compare_command(patched_cli, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert "A top-1" in result.output and "B top-1" in result.output
+    assert "KL(A‖B)" in result.output and "KL(B‖A)" in result.output and "JS" in result.output
     assert "diverges at layer" in result.output or "agree at every layer" in result.output
+    assert "JS first >=" in result.output
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(payload["top1_agreement"]) == 4
+    assert len(payload["layers"]) == 4
+    assert payload["kind"] == "prompt"
+
+
+def test_compare_command_token_index_b(patched_cli):
+    result = runner.invoke(
+        cli.app,
+        [
+            "compare",
+            "--text-a",
+            "the capital of japan is",
+            "--text-b",
+            "the capital of japan is tokyo",
+            "--token-index",
+            "-1",
+            "--token-index-b",
+            "-2",
+            "--top-k",
+            "3",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "analyzed 'is' at index 4" in result.output
+
+
+def test_compare_command_no_kl(patched_cli, tmp_path):
+    json_path = tmp_path / "compare.json"
+    result = runner.invoke(
+        cli.app,
+        [
+            "compare",
+            "--text-a",
+            "the capital of japan is",
+            "--text-b",
+            "sales were 150 yen",
+            "--top-k",
+            "3",
+            "--no-kl",
+            "--json",
+            str(json_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no distributions" in result.output
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert all(layer["kl_a_b"] is None for layer in payload["layers"])
+    assert payload["metadata"]["keep_log_probs"] is False
+
+
+def test_compare_command_html(patched_cli, tmp_path):
+    pytest.importorskip("plotly")
+    html_path = tmp_path / "compare.html"
+    result = runner.invoke(
+        cli.app,
+        [
+            "compare",
+            "--text-a",
+            "the capital of japan is",
+            "--text-b",
+            "sales were 150 yen",
+            "--top-k",
+            "3",
+            "--html",
+            str(html_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert html_path.exists()
 
 
 def test_diff_command(patched_cli, tmp_path):

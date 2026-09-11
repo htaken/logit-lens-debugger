@@ -12,6 +12,7 @@ from .adapters import (
 )
 from .analyzer import LogitLensAnalyzer
 from .anomaly import detect_anomalies, score_position
+from .comparison import compare_results
 from .diff import diff_token_sequences, select_positions, token_class
 from .engine import LogitLensEngine
 from .metrics import compute_instability
@@ -22,6 +23,7 @@ from .types import (
     ComparisonResult,
     DiffSpan,
     InstabilityMetrics,
+    LayerComparison,
     LayerResult,
     LensMode,
     LogitLensResult,
@@ -41,6 +43,7 @@ __all__ = [
     "DiffSpan",
     "HFCausalLMAdapter",
     "InstabilityMetrics",
+    "LayerComparison",
     "LayerResult",
     "LensMode",
     "LlamaAdapter",
@@ -56,6 +59,7 @@ __all__ = [
     "UnsupportedModelError",
     "__version__",
     "adapter_for_model",
+    "compare_results",
     "compute_instability",
     "detect_anomalies",
     "diff_token_sequences",

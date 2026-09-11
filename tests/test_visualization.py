@@ -3,10 +3,13 @@ from __future__ import annotations
 import pytest
 
 from logit_lens_debugger.visualization import (
+    build_comparison_figure,
     build_heatmap_figure,
     build_trajectory_figure,
+    export_comparison_html,
     export_heatmap_html,
     export_trajectory_html,
+    format_comparison,
     format_layers,
     format_trajectory,
 )
@@ -78,3 +81,42 @@ def test_trajectory_figure_series(sample_result, analyzer):
 
     no_target = analyzer.analyze("the capital of japan is", token_index=-1, top_k=3)
     assert len(build_trajectory_figure(no_target).data) == 1
+
+
+def test_format_comparison_table(analyzer):
+    cmp = analyzer.compare("the capital of japan is", "sales were 150 yen", top_k=3)
+    text = format_comparison(cmp)
+    assert "KL(A‖B)" in text and "KL(B‖A)" in text and "JS" in text
+    assert "overlap" in text
+    assert "JS first >=" in text
+
+    no_kl_cmp = analyzer.compare(
+        "the capital of japan is", "sales were 150 yen", top_k=3, keep_log_probs=False
+    )
+    no_kl_text = format_comparison(no_kl_cmp)
+    assert "no distributions" in no_kl_text
+
+
+def test_comparison_figure_traces(analyzer):
+    pytest.importorskip("plotly")
+    cmp = analyzer.compare("the capital of japan is", "sales were 150 yen", top_k=3)
+    fig = build_comparison_figure(cmp)
+    names = {trace.name for trace in fig.data}
+    assert {"KL(A‖B)", "KL(B‖A)", "JS"} <= names
+
+    no_kl_cmp = analyzer.compare(
+        "the capital of japan is", "sales were 150 yen", top_k=3, keep_log_probs=False
+    )
+    fig_no_kl = build_comparison_figure(no_kl_cmp)
+    names_no_kl = {trace.name for trace in fig_no_kl.data}
+    assert not ({"KL(A‖B)", "KL(B‖A)", "JS"} & names_no_kl)
+
+
+def test_export_comparison_html(analyzer, tmp_path):
+    pytest.importorskip("plotly")
+    cmp = analyzer.compare("the capital of japan is", "sales were 150 yen", top_k=3)
+    path = export_comparison_html(cmp, tmp_path / "cmp.html", include_plotlyjs="cdn")
+    assert path.exists()
+    content = path.read_text(encoding="utf-8")
+    assert "<html" in content.lower()
+    assert "plotly" in content

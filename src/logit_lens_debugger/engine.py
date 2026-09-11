@@ -9,11 +9,20 @@ discarded right after the top-k has been extracted.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
 from .adapters.base import ModelAdapter
 from .types import LayerResult, LensMode, TokenPrediction
+
+
+@dataclass
+class EngineOutput:
+    """Result of :meth:`LogitLensEngine.run_detailed`."""
+
+    layers: list[list[LayerResult]]
+    log_probs: torch.Tensor | None  # [num_layers + 1, P, V] CPU float32, or None
 
 
 class LogitLensEngine:
@@ -44,7 +53,6 @@ class LogitLensEngine:
             )
         return targets
 
-    @torch.inference_mode()
     def run(
         self,
         input_ids: torch.Tensor,
@@ -54,10 +62,36 @@ class LogitLensEngine:
     ) -> list[list[LayerResult]]:
         """Compute per-layer top-k predictions for each requested position.
 
-        Returns ``results[p][l]`` for position index ``p`` (in ``positions``
+        Thin wrapper around :meth:`run_detailed` that returns only ``.layers``
+        (i.e. ``keep_log_probs=False``, the current memory behaviour).
+        """
+        return self.run_detailed(
+            input_ids, positions, top_k=top_k, target_token_id=target_token_id
+        ).layers
+
+    @torch.inference_mode()
+    def run_detailed(
+        self,
+        input_ids: torch.Tensor,
+        positions: Sequence[int],
+        top_k: int = 10,
+        target_token_id: int | Sequence[int | None] | None = None,
+        keep_log_probs: bool = False,
+    ) -> EngineOutput:
+        """Compute per-layer top-k predictions for each requested position.
+
+        Returns ``output.layers[p][l]`` for position index ``p`` (in ``positions``
         order) and layer ``l`` in ``0..num_layers``. ``target_token_id`` is either
         a single id shared by every position, ``None`` (no target tracked for any
         position) or a sequence with one entry (an id or ``None``) per position.
+
+        With ``keep_log_probs=True``, ``output.log_probs`` additionally holds the
+        full-vocabulary log-probabilities for every layer and position (moved to
+        CPU float32 right after each layer's logits are computed), shape
+        ``[num_layers + 1, P, V]``; otherwise it is ``None``. This is the only way
+        to keep a full-vocabulary distribution around (e.g. for KL/JS comparisons
+        in :mod:`.comparison`), so it is opt-in and off by default -- the memory
+        behaviour of plain ``run()``/``keep_log_probs=False`` is unchanged.
         """
         if top_k < 1:
             raise ValueError("top_k must be >= 1")
@@ -79,6 +113,7 @@ class LogitLensEngine:
 
         hidden_states = self.adapter.get_hidden_states(input_ids, positions)
         results: list[list[LayerResult]] = [[] for _ in positions]
+        kept_log_probs: list[torch.Tensor] = []
 
         for layer_index, hidden in enumerate(hidden_states):
             logits = self.lens_logits(hidden)  # [P, V]
@@ -105,6 +140,9 @@ class LogitLensEngine:
                     strict=True,
                 ):
                     target_cpu[row] = (rank, logit, prob)
+
+            if keep_log_probs:
+                kept_log_probs.append(log_probs.detach().to("cpu", torch.float32))
 
             # Move the small per-position summaries to CPU, then free the full logits.
             top_logits_cpu = top_logits.cpu().tolist()
@@ -147,4 +185,5 @@ class LogitLensEngine:
                     )
                 )
 
-        return results
+        log_probs_out = torch.stack(kept_log_probs, dim=0) if keep_log_probs else None
+        return EngineOutput(layers=results, log_probs=log_probs_out)

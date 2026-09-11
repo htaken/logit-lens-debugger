@@ -124,4 +124,63 @@ def test_compare_different_texts(analyzer):
         "top1_agreement",
         "first_divergence_layer",
         "last_divergence_layer",
+        "layers",
+        "alignment",
+        "kind",
+        "metadata",
     }
+    assert comparison.kind == "prompt"
+    assert comparison.alignment == [(i, i) for i in range(len(comparison.top1_agreement))]
+    assert len(comparison.layers) == len(comparison.top1_agreement)
+
+
+def test_compare_identical_texts_kl_zero_everywhere(analyzer):
+    comparison = analyzer.compare("the capital of japan is", "the capital of japan is", top_k=3)
+    assert all(lc.topk_overlap == pytest.approx(1.0) for lc in comparison.layers)
+    assert all(lc.kl_a_b == pytest.approx(0.0, abs=1e-5) for lc in comparison.layers)
+    assert all(lc.kl_b_a == pytest.approx(0.0, abs=1e-5) for lc in comparison.layers)
+    assert all(lc.js == pytest.approx(0.0, abs=1e-5) for lc in comparison.layers)
+
+
+def test_compare_keep_log_probs_false_has_no_kl(analyzer):
+    comparison = analyzer.compare(
+        "the capital of japan is", "sales were 150 yen", top_k=3, keep_log_probs=False
+    )
+    assert all(lc.kl_a_b is None for lc in comparison.layers)
+    assert all(lc.kl_b_a is None for lc in comparison.layers)
+    assert all(lc.js is None for lc in comparison.layers)
+    # top1/overlap/target fields are still computed without distributions.
+    assert all(isinstance(lc.top1_same, bool) for lc in comparison.layers)
+
+
+def test_compare_token_index_b_uses_different_position(analyzer):
+    comparison = analyzer.compare(
+        "the capital of japan is",
+        "the capital of japan is tokyo",
+        token_index=-1,
+        token_index_b=-2,
+        top_k=3,
+    )
+    assert comparison.result_a.token_index == 4
+    assert comparison.result_b.token_index == 4
+    assert comparison.result_a.analyzed_token == comparison.result_b.analyzed_token == "is"
+
+
+def test_compare_common_target_token_populates_both_ranks(analyzer):
+    comparison = analyzer.compare(
+        "the capital of japan is", "sales were 150 yen", top_k=3, target_token="tokyo"
+    )
+    assert comparison.result_a.target_token_id == 6
+    assert comparison.result_b.target_token_id == 6
+    for lc in comparison.layers:
+        assert lc.target_rank_a is not None
+        assert lc.target_rank_b is not None
+
+
+def test_analyze_equals_analyze_detailed_result(analyzer):
+    result = analyzer.analyze("the capital of japan is tokyo", token_index=4, top_k=5)
+    detailed_result, log_probs = analyzer._analyze_detailed(
+        "the capital of japan is tokyo", token_index=4, top_k=5
+    )
+    assert result == detailed_result
+    assert log_probs is None

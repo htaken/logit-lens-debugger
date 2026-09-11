@@ -9,6 +9,7 @@ import typer
 
 from .analyzer import LogitLensAnalyzer
 from .types import AnomalyReport, ComparisonResult, LensMode, LogitLensResult
+from .visualization.comparison import format_comparison
 from .visualization.trajectory import (
     format_anomaly_report,
     format_diff_spans,
@@ -157,46 +158,61 @@ def compare(
     text_a: str = typer.Option(..., "--text-a", help="First input text."),
     text_b: str = typer.Option(..., "--text-b", help="Second input text."),
     model: str = typer.Option(DEFAULT_MODEL, "--model", "-m"),
-    token_index: int = typer.Option(-1, "--token-index", "-i", help="Applied to both texts."),
+    token_index: int = typer.Option(
+        -1, "--token-index", "-i", help="Position for text A (and B unless --token-index-b)."
+    ),
+    token_index_b: int | None = typer.Option(
+        None, "--token-index-b", help="Position for text B (default: same as --token-index)."
+    ),
     top_k: int = typer.Option(10, "--top-k", "-k", min=1),
+    target_token: str | None = typer.Option(
+        None,
+        "--target-token",
+        help="Track this token's rank/probability in both texts (default: each text's own next).",
+    ),
     lens_mode: LensMode = typer.Option(LensMode.FINAL_NORM, "--lens-mode", case_sensitive=False),
     device: str | None = typer.Option(None, "--device"),
     dtype: str | None = typer.Option(None, "--dtype"),
-    json_path: Path | None = typer.Option(None, "--json", help="Write both results and the diff."),
+    kl: bool = typer.Option(
+        True, "--kl/--no-kl", help="Keep full-vocab log-probs to compute KL/JS divergence."
+    ),
+    kl_threshold: float = typer.Option(
+        0.1, "--kl-threshold", help="JS divergence threshold reported in the footer line."
+    ),
+    json_path: Path | None = typer.Option(
+        None, "--json", help="Write the full ComparisonResult as JSON."
+    ),
+    html_path: Path | None = typer.Option(
+        None, "--html", help="Write a KL/JS-by-layer chart (plotly)."
+    ),
     trust_remote_code: bool = typer.Option(False, "--trust-remote-code"),
 ) -> None:
-    """Compare layer-wise top-1 predictions between two texts and report where they diverge."""
+    """Compare layer-wise predictions between two texts: top-1, KL/JS, overlap, target rank."""
     analyzer = _build_analyzer(model, device, dtype, lens_mode, trust_remote_code)
     comparison: ComparisonResult = analyzer.compare(
-        text_a, text_b, token_index=token_index, top_k=top_k
+        text_a,
+        text_b,
+        token_index=token_index,
+        token_index_b=token_index_b,
+        top_k=top_k,
+        target_token=target_token,
+        keep_log_probs=kl,
     )
     a, b = comparison.result_a, comparison.result_b
     typer.echo(f"Model: {a.model_name}  (lens={a.lens_mode.value})")
     typer.echo(f"A: {text_a!r}  -> analyzed {_display(a.analyzed_token)} at index {a.token_index}")
     typer.echo(f"B: {text_b!r}  -> analyzed {_display(b.analyzed_token)} at index {b.token_index}")
     typer.echo("")
-    typer.echo(f"{'layer':>5}  {'A top-1':<26} {'B top-1':<26} same")
-    for la, lb, same in zip(a.layers, b.layers, comparison.top1_agreement, strict=True):
-        typer.echo(
-            f"{la.layer_index:>5}  "
-            f"{_display(la.top1.token) + f' ({la.top1.probability:.3f})':<26} "
-            f"{_display(lb.top1.token) + f' ({lb.top1.probability:.3f})':<26} "
-            f"{'yes' if same else 'NO'}"
-        )
-    typer.echo("")
-    if comparison.first_divergence_layer is None:
-        typer.echo("Top-1 predictions agree at every layer.")
-    else:
-        differing = len(comparison.divergence_layers)
-        total = len(comparison.top1_agreement)
-        typer.echo(
-            f"Top-1 first diverges at layer {comparison.first_divergence_layer}, "
-            f"last differs at layer {comparison.last_divergence_layer} "
-            f"({differing} of {total} layers differ)."
-        )
+    typer.echo(format_comparison(comparison, kl_threshold=kl_threshold))
+
     if json_path is not None:
         comparison.save_json(json_path)
         typer.echo(f"Saved JSON to {json_path}")
+    if html_path is not None:
+        from .visualization.comparison import export_comparison_html
+
+        export_comparison_html(comparison, html_path)
+        typer.echo(f"Saved comparison chart to {html_path}")
 
 
 @app.command()

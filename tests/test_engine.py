@@ -156,6 +156,47 @@ def test_run_per_position_target_wrong_length_raises(qwen_adapter):
         engine.run(input_ids, positions=[1, 3], top_k=3, target_token_id=[6])
 
 
+def test_run_detailed_keep_log_probs_shape_and_normalization(qwen_adapter):
+    engine = LogitLensEngine(qwen_adapter)
+    input_ids = qwen_adapter.tokenize("the capital of japan is")
+    positions = [1, 3]
+    output = engine.run_detailed(input_ids, positions=positions, top_k=4, keep_log_probs=True)
+    vocab = qwen_adapter.model.config.vocab_size
+    num_layers = qwen_adapter.num_layers
+
+    assert output.log_probs is not None
+    assert output.log_probs.shape == (num_layers + 1, len(positions), vocab)
+    assert output.log_probs.dtype == torch.float32
+    assert output.log_probs.device.type == "cpu"
+    probs_sum = output.log_probs.exp().sum(dim=-1)
+    assert torch.allclose(probs_sum, torch.ones_like(probs_sum), atol=1e-4)
+
+    for p, layers in enumerate(output.layers):
+        for layer in layers:
+            top_ids = {t.token_id for t in layer.top_tokens}
+            layer_log_probs = output.log_probs[layer.layer_index, p]
+            top_ids_from_tensor = set(torch.topk(layer_log_probs, len(top_ids)).indices.tolist())
+            assert top_ids_from_tensor == top_ids
+
+
+def test_run_equals_run_detailed_layers(qwen_adapter):
+    engine = LogitLensEngine(qwen_adapter)
+    input_ids = qwen_adapter.tokenize("the capital of japan is")
+    positions = [0, 2, 4]
+    via_run = engine.run(input_ids, positions=positions, top_k=3, target_token_id=6)
+    via_detailed = engine.run_detailed(
+        input_ids, positions=positions, top_k=3, target_token_id=6
+    ).layers
+    assert via_run == via_detailed
+
+
+def test_run_detailed_keep_log_probs_false_is_none(qwen_adapter):
+    engine = LogitLensEngine(qwen_adapter)
+    input_ids = qwen_adapter.tokenize("the capital of japan is")
+    output = engine.run_detailed(input_ids, positions=[0], top_k=3, keep_log_probs=False)
+    assert output.log_probs is None
+
+
 def test_lens_mode_accepts_strings(qwen_adapter):
     assert LogitLensEngine(qwen_adapter, "raw").lens_mode is LensMode.RAW
     assert LogitLensEngine(qwen_adapter, "final-norm").lens_mode is LensMode.FINAL_NORM
