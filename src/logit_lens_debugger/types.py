@@ -379,6 +379,177 @@ class InstabilityMetrics:
         return cls(**data)
 
 
+#: Default signal weights for :func:`logit_lens_debugger.anomaly.detect_anomalies`:
+#: 60% lens-based signals (derived from the layer trajectory), 40% text-based
+#: signals (derived from the generated token and the source/diff). See
+#: ``docs/design-next-features.md`` §4 and the README's anomaly detection section.
+DEFAULT_ANOMALY_WEIGHTS: dict[str, float] = {
+    "low_final_prob": 0.15,
+    "final_rank": 0.10,
+    "final_entropy": 0.05,
+    "late_emergence": 0.15,
+    "instability": 0.10,
+    "flip_at_end": 0.05,
+    "in_diff": 0.15,
+    "numeric": 0.05,
+    "novel": 0.10,
+    "entity_like": 0.05,
+    "entity": 0.05,
+}
+
+
+@dataclass(frozen=True)
+class AnomalyConfig:
+    """Weights and thresholds for :func:`logit_lens_debugger.anomaly.detect_anomalies`.
+
+    ``weights`` maps signal name -> weight; a signal with weight 0 (or absent
+    from this mapping) never contributes to the score. ``flag_threshold`` gates
+    :attr:`PositionAnomaly.flags`; ``score_threshold`` is the default cutoff for
+    :meth:`AnomalyReport.flagged`. ``from_layer`` / ``late_fraction`` are forwarded
+    to :func:`~logit_lens_debugger.metrics.compute_instability`.
+    """
+
+    weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ANOMALY_WEIGHTS))
+    flag_threshold: float = 0.5
+    score_threshold: float = 0.5
+    from_layer: int = 1
+    late_fraction: float = 1 / 3
+    rank_saturation_log2: float = 10.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "weights": dict(self.weights),
+            "flag_threshold": self.flag_threshold,
+            "score_threshold": self.score_threshold,
+            "from_layer": self.from_layer,
+            "late_fraction": self.late_fraction,
+            "rank_saturation_log2": self.rank_saturation_log2,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AnomalyConfig:
+        return cls(
+            weights=dict(data["weights"]) if "weights" in data else dict(DEFAULT_ANOMALY_WEIGHTS),
+            flag_threshold=data.get("flag_threshold", 0.5),
+            score_threshold=data.get("score_threshold", 0.5),
+            from_layer=data.get("from_layer", 1),
+            late_fraction=data.get("late_fraction", 1 / 3),
+            rank_saturation_log2=data.get("rank_saturation_log2", 10.0),
+        )
+
+
+@dataclass
+class PositionAnomaly:
+    """Anomaly score for one analyzed position, produced by :func:`.anomaly.score_position`.
+
+    ``signals`` only contains the signals that could be evaluated for this
+    position (see the module docstring of :mod:`.anomaly`); a missing signal
+    never contributed to ``score``, it was not scored as 0.
+    """
+
+    token_index: int
+    output_index: int | None
+    token: str | None
+    token_id: int | None
+    score: float
+    signals: dict[str, float]
+    flags: list[str]
+    diff_span: DiffSpan | None
+    instability: InstabilityMetrics | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "token_index": self.token_index,
+            "output_index": self.output_index,
+            "token": self.token,
+            "token_id": self.token_id,
+            "score": self.score,
+            "signals": dict(self.signals),
+            "flags": list(self.flags),
+            "diff_span": self.diff_span.to_dict() if self.diff_span is not None else None,
+            "instability": (self.instability.to_dict() if self.instability is not None else None),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PositionAnomaly:
+        diff_span = data.get("diff_span")
+        instability = data.get("instability")
+        return cls(
+            token_index=data["token_index"],
+            output_index=data.get("output_index"),
+            token=data.get("token"),
+            token_id=data.get("token_id"),
+            score=data["score"],
+            signals=dict(data.get("signals", {})),
+            flags=list(data.get("flags", [])),
+            diff_span=DiffSpan.from_dict(diff_span) if diff_span is not None else None,
+            instability=(
+                InstabilityMetrics.from_dict(instability) if instability is not None else None
+            ),
+        )
+
+
+@dataclass
+class AnomalyReport:
+    """Scored positions for one context, produced by :func:`.anomaly.detect_anomalies`.
+
+    ``positions`` is sorted by score descending, then ``token_index`` ascending.
+    """
+
+    model_name: str
+    lens_mode: LensMode
+    text: str
+    prompt_length: int
+    config: AnomalyConfig
+    positions: list[PositionAnomaly]
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def flagged(self, threshold: float | None = None) -> list[PositionAnomaly]:
+        """Positions scoring at or above ``threshold`` (default: ``config.score_threshold``)."""
+        cutoff = self.config.score_threshold if threshold is None else threshold
+        return [p for p in self.positions if p.score >= cutoff]
+
+    def top(self, n: int) -> list[PositionAnomaly]:
+        """The ``n`` highest-scoring positions (``positions`` is already sorted)."""
+        return self.positions[:n]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "lens_mode": self.lens_mode.value,
+            "text": self.text,
+            "prompt_length": self.prompt_length,
+            "config": self.config.to_dict(),
+            "positions": [p.to_dict() for p in self.positions],
+            "metadata": dict(self.metadata),
+        }
+
+    def to_json(self, indent: int | None = 2) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+
+    def save_json(self, path: str | Path) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_json(), encoding="utf-8")
+        return path
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AnomalyReport:
+        return cls(
+            model_name=data["model_name"],
+            lens_mode=LensMode(data["lens_mode"]),
+            text=data["text"],
+            prompt_length=data["prompt_length"],
+            config=AnomalyConfig.from_dict(data["config"]),
+            positions=[PositionAnomaly.from_dict(p) for p in data["positions"]],
+            metadata=dict(data.get("metadata", {})),
+        )
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> AnomalyReport:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
 @dataclass
 class ComparisonResult:
     """Layer-wise comparison of two lens runs (e.g. prompt A vs prompt B)."""

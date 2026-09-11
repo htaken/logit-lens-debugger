@@ -145,6 +145,37 @@ def test_diff_command_requires_source_or_source_file(patched_cli):
     assert result.exit_code != 0
 
 
+def test_scan_command(patched_cli, tmp_path):
+    json_path = tmp_path / "scan.json"
+    result = runner.invoke(
+        cli.app,
+        [
+            "scan",
+            "--prompt",
+            "the capital of japan is",
+            "--output",
+            "tokyo osaka",
+            "--source",
+            "the capital of japan is tokyo",
+            "--top-k",
+            "3",
+            "--json",
+            str(json_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Anomaly report:" in result.output
+    assert "score" in result.output
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert "positions" in payload
+    assert len(payload["positions"]) == 2
+
+
+def test_scan_command_requires_output(patched_cli):
+    result = runner.invoke(cli.app, ["scan", "--prompt", "the capital of japan is"])
+    assert result.exit_code != 0
+
+
 def test_metrics_command(sample_result, tmp_path):
     json_path = sample_result.save_json(tmp_path / "result.json")
     out_path = tmp_path / "metrics.json"

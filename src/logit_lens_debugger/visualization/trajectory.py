@@ -5,7 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..types import DiffSpan, InstabilityMetrics, LogitLensResult, MultiPositionResult
+from ..types import (
+    AnomalyReport,
+    DiffSpan,
+    InstabilityMetrics,
+    LogitLensResult,
+    MultiPositionResult,
+)
 from ._theme import CATEGORICAL, base_layout, display_token, layer_label, require_plotly
 
 
@@ -114,6 +120,37 @@ def format_position_summary(result: MultiPositionResult) -> str:
                 trajectory_parts.append(f"layer {layer.layer_index} {display_token(top1.token)}")
                 previous_id = top1.token_id
         lines.append("  " + " -> ".join(trajectory_parts))
+    return "\n".join(lines)
+
+
+def format_anomaly_report(
+    report: AnomalyReport, top_n: int = 20, threshold: float | None = None
+) -> str:
+    """Header + fixed-width table of the top-scoring positions of an ``AnomalyReport``.
+
+    ``threshold`` (default: ``report.config.score_threshold``) is only used for the
+    "N with score >= T" header count; ``top_n`` controls how many rows are printed
+    (the report itself is already sorted score desc, then ``token_index`` asc).
+    """
+    cutoff = report.config.score_threshold if threshold is None else threshold
+    flagged = report.flagged(cutoff)
+    lines = [
+        f"Anomaly report: {len(report.positions)} positions scored, "
+        f"{len(flagged)} with score >= {cutoff:.2f}",
+        "",
+        f"{'pos':>5} {'out#':>5} {'token':<16} {'score':>6} {'final_p':>8} {'settle':>6}  flags",
+    ]
+    for anomaly in report.top(top_n):
+        out_idx = "-" if anomaly.output_index is None else str(anomaly.output_index)
+        token = "-" if anomaly.token is None else display_token(anomaly.token)
+        low_final_prob = anomaly.signals.get("low_final_prob")
+        final_p = "-" if low_final_prob is None else f"{1.0 - low_final_prob:.3f}"
+        settle = "-" if anomaly.instability is None else str(anomaly.instability.settle_layer)
+        flags = ",".join(anomaly.flags) if anomaly.flags else "-"
+        lines.append(
+            f"{anomaly.token_index:>5} {out_idx:>5} {token:<16} "
+            f"{anomaly.score:>6.3f} {final_p:>8} {settle:>6}  {flags}"
+        )
     return "\n".join(lines)
 
 

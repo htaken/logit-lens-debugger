@@ -10,7 +10,14 @@ import torch
 
 from logit_lens_debugger import LogitLensAnalyzer
 from logit_lens_debugger.adapters import adapter_for_model
-from logit_lens_debugger.types import LayerResult, LensMode, LogitLensResult, TokenPrediction
+from logit_lens_debugger.types import (
+    LayerResult,
+    LensMode,
+    LogitLensResult,
+    MultiPositionResult,
+    PositionResult,
+    TokenPrediction,
+)
 
 VOCAB = (
     [
@@ -187,4 +194,51 @@ def make_result(
         layers=layers,
         target_token=f"t{target_token_id}" if target_token_id is not None else None,
         target_token_id=target_token_id,
+    )
+
+
+def to_position_result(
+    result: LogitLensResult,
+    target_token: str | None = None,
+    diff_span=None,
+) -> PositionResult:
+    """Wrap a ``make_result``-built ``LogitLensResult`` into a matching ``PositionResult``,
+    for ``anomaly.score_position(position, ..., context_result=result)`` tests.
+
+    ``target_token`` overrides the generated-token text independently of the
+    layer-tracked ``target_token_id`` -- the anomaly module never requires them to
+    match, since ``PositionResult.target_token`` is only used for the text-based
+    signals while ``layer.target`` drives the lens-based ones.
+    """
+    return PositionResult(
+        token_index=result.token_index,
+        layers=result.layers,
+        target_token=target_token if target_token is not None else result.target_token,
+        target_token_id=result.target_token_id,
+        diff_span=diff_span,
+    )
+
+
+def make_multi_position_result(
+    positions: list[PositionResult],
+    prompt_length: int = 0,
+    top_k: int = 3,
+    metadata: dict | None = None,
+) -> MultiPositionResult:
+    """Wrap synthetic ``PositionResult``s (e.g. from ``to_position_result``) into a
+    ``MultiPositionResult``, for ``anomaly.detect_anomalies`` tests.
+
+    ``input_tokens`` / ``input_token_ids`` are unused by anomaly scoring, so they are
+    left as placeholders rather than reconstructed from the positions.
+    """
+    return MultiPositionResult(
+        model_name="synthetic",
+        lens_mode=LensMode.FINAL_NORM,
+        text="synthetic",
+        input_tokens=["synthetic"],
+        input_token_ids=[0],
+        prompt_length=prompt_length,
+        top_k=top_k,
+        positions=positions,
+        metadata=dict(metadata or {}),
     )

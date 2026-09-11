@@ -68,6 +68,11 @@ class ModelAdapter(ABC):
     def num_layers(self) -> int:
         """Number of decoder blocks."""
 
+    @property
+    def vocab_size(self) -> int | None:
+        """Size of the output vocabulary, when known (used by entropy-based signals)."""
+        return None
+
     @abstractmethod
     def tokenize(self, text: str) -> torch.Tensor:
         """Return ``input_ids`` of shape ``[1, seq_len]`` on ``self.device``."""
@@ -188,6 +193,10 @@ class HFCausalLMAdapter(ModelAdapter):
     @property
     def num_layers(self) -> int:
         return len(self._layers())
+
+    @property
+    def vocab_size(self) -> int | None:
+        return self._lm_head().weight.shape[0]
 
     def tokenize(self, text: str) -> torch.Tensor:
         encoded = self.tokenizer(text, return_tensors="pt")

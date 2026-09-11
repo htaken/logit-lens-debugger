@@ -154,6 +154,11 @@ uv run logit-lens metrics outputs/qa.json --from-layer 1 --json outputs/qa_metri
 uv run logit-lens diff --model Qwen/Qwen2.5-0.5B \
   --source "売上は150万円でした" --output "売上は1500万円でした" \
   --context 1 --json outputs/diff.json --html-dir outputs/diff_html
+
+# 出力の各 token を anomaly スコアでスキャンする
+uv run logit-lens scan --model Qwen/Qwen2.5-0.5B \
+  --prompt "売上は150万円でした。要約して。" --output "売上は1500万円でした。" \
+  --source "売上は150万円でした" --top 20 --json outputs/anomaly.json
 ```
 
 ### Python API
@@ -360,6 +365,89 @@ uv run logit-lens diff --source "sales were 150 yen" --output "sales were 1500 y
 
 > **制約**: diff は token 列ベースなので、出力が原文を大幅に言い換えている場合は span がほぼ全域になり絞り込みの効果が薄れます。文字オフセットベースの diff は未実装です。
 
+#### 自動 anomaly detection（怪しい token のスコアリング）
+
+出力の各 token を「lens の trajectory がどれだけ不安定か」「原文と比べてどれだけ新規か」という observable な signal でスコアリングし、調べるべき候補に優先順位を付けます。既定では出力の全 token が対象、`only_diff=True`（CLI: `--only-diff`）を指定すると機能 1 の diff span に絞れます。
+
+| signal | 種別 | 意味 |
+|---|---|---|
+| `low_final_prob` | lens 系 | 最終 layer でも target の確率が低い（`1 - p_final`） |
+| `final_rank` | lens 系 | 最終 layer で target が top-1 でない（rank の log スケール、既定で rank 1024 が上限） |
+| `final_entropy` | lens 系 | 最終 layer の分布のエントロピー（`log(vocab_size)` で正規化） |
+| `late_emergence` | lens 系 | target が top-k に入るのが最終層直前までかかった（機能 3 の `target_first_topk_layer`） |
+| `instability` | lens 系 | 機能 3 の `instability_score` |
+| `flip_at_end` | lens 系 | 最終 1〜2 layer で top-1 が入れ替わった |
+| `in_diff` | テキスト系 | 機能 1 の diff span 内にある |
+| `numeric` | テキスト系 | 数字 token（`token_class(tok) == "digit"`） |
+| `novel` | テキスト系 | 原文の token 列に一度も現れない content token（記号・機能語・単独のかな粒子は除外） |
+| `entity_like` | テキスト系 | `novel` かつ 先頭大文字 / 漢字 / カタカナのみ |
+| `entity` | テキスト系 | 外部 NER から渡された `entity_spans` に含まれる |
+
+各 signal は `[0, 1]` に収まる heuristic で、**評価できない signal は 0 ではなく省略され**、合成スコアは省略された signal を除いた重み付き平均になります（例: target を追跡できない position では `low_final_prob` / `final_rank` / `late_emergence` が丸ごと省略されます）。既定の重みは lens 系 60% / テキスト系 40% です。
+
+```python
+from logit_lens_debugger import DEFAULT_ANOMALY_WEIGHTS
+DEFAULT_ANOMALY_WEIGHTS
+# {"low_final_prob": 0.15, "final_rank": 0.10, "final_entropy": 0.05, "late_emergence": 0.15,
+#  "instability": 0.10, "flip_at_end": 0.05,
+#  "in_diff": 0.15, "numeric": 0.05, "novel": 0.10, "entity_like": 0.05, "entity": 0.05}
+```
+
+`AnomalyConfig` で重みと閾値を変更できます（`weights` / `flag_threshold` / `score_threshold` / `from_layer` / `late_fraction` / `rank_saturation_log2`）。JSON に含めて再現可能です。
+
+```python
+from logit_lens_debugger import AnomalyConfig
+
+report = analyzer.detect_anomalies(
+    prompt="次の文字起こしを要約してください:\n" + transcript,
+    output=llm_output,
+    source=transcript,             # 省略すると novel/in_diff は評価されない
+    top_k=10,
+    config=AnomalyConfig(score_threshold=0.6),
+)
+
+for anomaly in report.top(10):
+    anomaly.token_index      # 解析した residual stream position
+    anomaly.output_index     # 出力 token 列での index（token_index が prompt 内なら None）
+    anomaly.token            # 実際に生成された token
+    anomaly.score            # 合成スコア
+    anomaly.signals          # 評価できた signal のみを含む dict
+    anomaly.flags            # flag_threshold 以上だった signal 名（DEFAULT_ANOMALY_WEIGHTS の順）
+
+report.flagged()            # score >= config.score_threshold の position だけ
+report.save_json("outputs/anomaly.json")   # AnomalyReport.load_json() で復元可能
+```
+
+`only_diff=True` は `source` が必須で（省略すると `ValueError`）、機能 1 と同じ `context` / `chunk_size` を受け取ります。`source` を渡しつつ `only_diff=False`（既定）の場合は、全 token を解析しつつ diff span も計算して `in_diff` を有効にします。
+
+**NER との連携（hook）**: 「原文にない固有名詞」「entity の変更」の検出そのものはこのパッケージのスコープ外です。外部の NER 結果があれば `entity_spans`（出力 token index の `[start, end)` 範囲のリスト）を渡すと `entity` signal に反映されます。
+
+```python
+# 外部 NER が output の 2 番目の token を固有名詞と判定した場合
+analyzer.detect_anomalies(prompt, output, source=source, entity_spans=[(1, 2)])
+```
+
+CLI からは `scan` コマンドで同じことができます。
+
+```bash
+# prompt.txt = モデルに実際に渡した文字列（指示 + 文字起こし）、summary.txt = LLM の出力
+uv run logit-lens scan --model Qwen/Qwen2.5-0.5B \
+  --prompt-file prompt.txt --output-file summary.txt --source-file transcript.txt \
+  --top 20 --threshold 0.5 --json outputs/anomaly.json
+```
+
+```
+Model: Qwen/Qwen2.5-0.5B  (lens=final-norm)
+Context: 512 tokens (prompt 480, output 32)
+
+Anomaly report: 32 positions scored, 4 with score >= 0.50
+  pos out# token             score  final_p settle  flags
+  501    21 大阪               0.81    0.312      22  novel,entity_like,low_final_prob
+  ...
+```
+
+> **注意**: anomaly スコアは「どの position を先に見るか」の優先順位付けであり、それ自体が問題の証拠ではありません。中間 layer の予測（`late_emergence` / `instability`）は特に小規模モデルで不安定なのが常態で、単独では判断材料になりません。`novel` / `entity_like` は文字クラスに基づく粗い近似であり、本物の NER ではありません。
+
 #### 可視化
 
 ```python
@@ -433,8 +521,9 @@ Hugging Face Transformers
 | `src/logit_lens_debugger/analyzer.py` | 高レベル API（`analyze_positions` / `analyze_generation` / `analyze_diff` を含む） |
 | `src/logit_lens_debugger/metrics.py` | `compute_instability()` → `InstabilityMetrics`（torch 非依存、JSON からも計算可） |
 | `src/logit_lens_debugger/diff.py` | `diff_token_sequences()` / `select_positions()` / `token_class()`（torch 非依存、diff から対象 position を選ぶ） |
+| `src/logit_lens_debugger/anomaly.py` | `score_position()` / `detect_anomalies()` → `AnomalyReport`（torch 非依存、diff / instability を合成して token をスコアリング） |
 | `src/logit_lens_debugger/visualization/` | ヒートマップ・trajectory（Plotly）とテキスト整形 |
-| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `diff` / `metrics` / `visualize`） |
+| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `diff` / `scan` / `metrics` / `visualize`） |
 | `tests/` | 極小ランダム初期化モデルによるオフラインテスト + opt-in の実モデル統合テスト |
 | `examples/basic_analysis.py` | API の最小サンプル |
 
@@ -494,7 +583,7 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 設計上は以下を後付けしやすくしています。
 
 1. ~~Input / Output diff → 対象 position の自動選択~~ → 実装済み（`diff.py`、`analyzer.analyze_diff()` / `analyze_generation()` / `analyze_positions()`、CLI `diff` コマンド）
-2. **自動 anomaly detection**（9.2）: `LayerResult.entropy` と `layer.target.rank` の推移が既に記録されているので、「最終層直前まで target の rank が低い」「entropy が高い」token をスコアリングする。
+2. ~~自動 anomaly detection~~ → 実装済み（`anomaly.py`、`analyzer.detect_anomalies()`、CLI `scan` コマンド）
 3. ~~Layer instability スコア~~ → 実装済み（`metrics.py`）
 4. **Prompt comparison の拡張**（9.4）: `compare()` を position 対応付け付きに拡張し、top-1 一致だけでなく layer ごとの KL divergence や target rank 差を出す。
 5. **Model comparison**（9.5）: 2 つの `LogitLensAnalyzer` の結果を同じ `ComparisonResult` 形式で並べる。

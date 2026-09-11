@@ -8,8 +8,9 @@ from pathlib import Path
 import typer
 
 from .analyzer import LogitLensAnalyzer
-from .types import ComparisonResult, LensMode, LogitLensResult
+from .types import AnomalyReport, ComparisonResult, LensMode, LogitLensResult
 from .visualization.trajectory import (
+    format_anomaly_report,
     format_diff_spans,
     format_instability,
     format_layers,
@@ -44,6 +45,24 @@ def _build_analyzer(
         lens_mode=lens_mode,
         trust_remote_code=trust_remote_code,
     )
+
+
+def _read_text_option(name: str, text: str | None, path: Path | None, required: bool) -> str | None:
+    """Resolve a ``--<name>``/``--<name>-file`` option pair to the effective text.
+
+    ``required``: exactly one of ``text``/``path`` must be given. Otherwise at most
+    one may be given; if neither is, ``None`` is returned.
+    """
+    if required:
+        if (text is None) == (path is None):
+            raise typer.BadParameter(f"Provide exactly one of --{name} or --{name}-file.")
+    elif text is not None and path is not None:
+        raise typer.BadParameter(f"Provide at most one of --{name} or --{name}-file.")
+    if text is not None:
+        return text
+    if path is not None:
+        return path.read_text(encoding="utf-8")
+    return None
 
 
 def _display(token: str) -> str:
@@ -224,20 +243,9 @@ def diff(
     trust_remote_code: bool = typer.Option(False, "--trust-remote-code"),
 ) -> None:
     """Diff source text against model output and analyze only the flagged token positions."""
-    if (source is None) == (source_file is None):
-        raise typer.BadParameter("Provide exactly one of --source or --source-file.")
-    if (output is None) == (output_file is None):
-        raise typer.BadParameter("Provide exactly one of --output or --output-file.")
-    if prompt is not None and prompt_file is not None:
-        raise typer.BadParameter("Provide at most one of --prompt or --prompt-file.")
-
-    source_text = source if source is not None else source_file.read_text(encoding="utf-8")
-    output_text = output if output is not None else output_file.read_text(encoding="utf-8")
-    prompt_text = (
-        prompt
-        if prompt is not None
-        else (prompt_file.read_text(encoding="utf-8") if prompt_file is not None else None)
-    )
+    source_text = _read_text_option("source", source, source_file, required=True)
+    output_text = _read_text_option("output", output, output_file, required=True)
+    prompt_text = _read_text_option("prompt", prompt, prompt_file, required=False)
 
     analyzer = _build_analyzer(model, device, dtype, lens_mode, trust_remote_code)
     result = analyzer.analyze_diff(
@@ -281,6 +289,78 @@ def diff(
         for single in result.to_results():
             export_heatmap_html(single, html_dir / f"position_{single.token_index}.html")
         typer.echo(f"Saved heatmaps to {html_dir}")
+
+
+@app.command()
+def scan(
+    prompt: str | None = typer.Option(None, "--prompt", help="Prompt text given to the model."),
+    prompt_file: Path | None = typer.Option(
+        None, "--prompt-file", help="Read prompt text from a file."
+    ),
+    output: str | None = typer.Option(None, "--output", help="Model output text."),
+    output_file: Path | None = typer.Option(
+        None, "--output-file", help="Read output text from a file."
+    ),
+    source: str | None = typer.Option(
+        None, "--source", help="Original/source text (enables the novel/in_diff signals)."
+    ),
+    source_file: Path | None = typer.Option(
+        None, "--source-file", help="Read source text from a file."
+    ),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m"),
+    top_k: int = typer.Option(10, "--top-k", "-k", min=1),
+    lens_mode: LensMode = typer.Option(LensMode.FINAL_NORM, "--lens-mode", case_sensitive=False),
+    device: str | None = typer.Option(None, "--device"),
+    dtype: str | None = typer.Option(None, "--dtype"),
+    only_diff: bool = typer.Option(
+        False, "--only-diff", help="Score only the positions the source/output diff flags."
+    ),
+    context: int = typer.Option(
+        0, "--context", help="Extra output tokens scored around each diff span (with --only-diff)."
+    ),
+    top: int = typer.Option(20, "--top", help="Rows printed in the report table."),
+    threshold: float = typer.Option(
+        0.5, "--threshold", help="Score cutoff for the 'flagged' count in the report header."
+    ),
+    chunk_size: int | None = typer.Option(
+        64, "--chunk-size", help="Positions scored per forward pass (memory/speed trade-off)."
+    ),
+    json_path: Path | None = typer.Option(
+        None, "--json", help="Write the full AnomalyReport as JSON."
+    ),
+    trust_remote_code: bool = typer.Option(False, "--trust-remote-code"),
+) -> None:
+    """Score every (or, with --only-diff, every diff-flagged) output token for anomalies."""
+    prompt_text = _read_text_option("prompt", prompt, prompt_file, required=True)
+    output_text = _read_text_option("output", output, output_file, required=True)
+    source_text = _read_text_option("source", source, source_file, required=False)
+    if only_diff and source_text is None:
+        raise typer.BadParameter("--only-diff requires --source or --source-file.")
+
+    analyzer = _build_analyzer(model, device, dtype, lens_mode, trust_remote_code)
+    report: AnomalyReport = analyzer.detect_anomalies(
+        prompt_text,
+        output_text,
+        source=source_text,
+        top_k=top_k,
+        only_diff=only_diff,
+        context=context,
+        chunk_size=chunk_size,
+    )
+
+    prompt_length = len(analyzer.adapter.tokenize(prompt_text)[0])
+    output_length = len(analyzer.adapter.encode(output_text))
+    typer.echo(f"Model: {report.model_name}  (lens={report.lens_mode.value})")
+    typer.echo(
+        f"Context: {prompt_length + output_length} tokens "
+        f"(prompt {prompt_length}, output {output_length})"
+    )
+    typer.echo("")
+    typer.echo(format_anomaly_report(report, top, threshold))
+
+    if json_path is not None:
+        report.save_json(json_path)
+        typer.echo(f"\nSaved JSON to {json_path}")
 
 
 @app.command()

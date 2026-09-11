@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from conftest import VOCAB
 from logit_lens_debugger.adapters import (
     LlamaAdapter,
     QwenAdapter,
@@ -33,6 +34,10 @@ def test_adapter_for_model_picks_family(qwen_adapter, llama_adapter):
     assert isinstance(llama_adapter, LlamaAdapter)
     assert qwen_adapter.num_layers == 3
     assert llama_adapter.num_layers == 2
+
+
+def test_vocab_size(qwen_adapter):
+    assert qwen_adapter.vocab_size == len(VOCAB)
 
 
 @pytest.mark.parametrize("adapter_fixture", ["qwen_adapter", "llama_adapter"])

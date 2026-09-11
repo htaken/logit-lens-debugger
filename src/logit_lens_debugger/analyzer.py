@@ -11,9 +11,18 @@ import torch
 
 from .adapters.base import ModelAdapter
 from .adapters.registry import load_adapter
+from .anomaly import detect_anomalies as _score_anomalies
 from .diff import diff_token_sequences, select_positions
 from .engine import LogitLensEngine
-from .types import ComparisonResult, LensMode, LogitLensResult, MultiPositionResult, PositionResult
+from .types import (
+    AnomalyConfig,
+    AnomalyReport,
+    ComparisonResult,
+    LensMode,
+    LogitLensResult,
+    MultiPositionResult,
+    PositionResult,
+)
 
 
 def normalize_index(index: int, length: int) -> int:
@@ -104,7 +113,7 @@ class LogitLensAnalyzer:
             layers=layers,
             target_token=self.adapter.decode_token(target_id) if target_id is not None else None,
             target_token_id=target_id,
-            metadata={"device": str(self.adapter.device)},
+            metadata={"device": str(self.adapter.device), "vocab_size": self.adapter.vocab_size},
         )
 
     def _resolve_target(self, target_token: str | int) -> int:
@@ -121,6 +130,13 @@ class LogitLensAnalyzer:
                 stacklevel=3,
             )
         return ids[0]
+
+    def _output_ids(self, output: str | Sequence[int]) -> list[int]:
+        """Token ids for ``output``: encoded if a string, taken as-is (a fresh list) otherwise."""
+        return self.adapter.encode(output) if isinstance(output, str) else list(output)
+
+    def _decode_tokens(self, ids: Sequence[int]) -> list[str]:
+        return [self.adapter.decode_token(i) for i in ids]
 
     # ------------------------------------------------------------- multi-position
 
@@ -220,7 +236,7 @@ class LogitLensAnalyzer:
             prompt_length=prompt_length,
             top_k=top_k,
             positions=position_results,
-            metadata={"device": str(self.adapter.device)},
+            metadata={"device": str(self.adapter.device), "vocab_size": self.adapter.vocab_size},
         )
 
     def analyze_generation(
@@ -240,7 +256,7 @@ class LogitLensAnalyzer:
         replay a generation log exactly; a string is encoded without special tokens.
         """
         prompt_ids: list[int] = self.adapter.tokenize(prompt)[0].tolist()
-        output_ids = self.adapter.encode(output) if isinstance(output, str) else list(output)
+        output_ids = self._output_ids(output)
         context_ids = prompt_ids + output_ids
         prompt_length = len(prompt_ids)
 
@@ -279,12 +295,12 @@ class LogitLensAnalyzer:
         """
         prompt_text = source if prompt is None else prompt
         prompt_ids: list[int] = self.adapter.tokenize(prompt_text)[0].tolist()
-        output_ids = self.adapter.encode(output) if isinstance(output, str) else list(output)
+        output_ids = self._output_ids(output)
         context_ids = prompt_ids + output_ids
         prompt_length = len(prompt_ids)
 
-        source_tokens = [self.adapter.decode_token(i) for i in self.adapter.encode(source)]
-        output_tokens = [self.adapter.decode_token(i) for i in output_ids]
+        source_tokens = self._decode_tokens(self.adapter.encode(source))
+        output_tokens = self._decode_tokens(output_ids)
         spans = diff_token_sequences(source_tokens, output_tokens, expand_spans=expand_spans)
         pairs = select_positions(
             spans,
@@ -305,7 +321,10 @@ class LogitLensAnalyzer:
                 top_k=top_k,
                 positions=[],
                 diff_spans=spans,
-                metadata={"device": str(self.adapter.device)},
+                metadata={
+                    "device": str(self.adapter.device),
+                    "vocab_size": self.adapter.vocab_size,
+                },
             )
 
         span_by_position = dict(pairs)
@@ -321,6 +340,64 @@ class LogitLensAnalyzer:
             for pos_result in result.positions
         ]
         return replace(result, positions=positions_with_spans, diff_spans=spans)
+
+    # ----------------------------------------------------------------- anomaly
+
+    def detect_anomalies(
+        self,
+        prompt: str,
+        output: str | Sequence[int],
+        source: str | None = None,
+        top_k: int = 10,
+        config: AnomalyConfig | None = None,
+        only_diff: bool = False,
+        context: int = 0,
+        chunk_size: int | None = 64,
+        entity_spans: Sequence[tuple[int, int]] | None = None,
+    ) -> AnomalyReport:
+        """Score every (or, with ``only_diff``, every diff-flagged) output token for anomalies.
+
+        With ``only_diff`` (requires ``source``), only the positions
+        :meth:`analyze_diff` flags are scored. Otherwise every output token is
+        scored (:meth:`analyze_generation`); if ``source`` is also given, its diff
+        against ``output`` is additionally computed so ``in_diff`` still reflects
+        the changed span even though every position gets a score. ``chunk_size``
+        defaults to 64 here (rather than ``None``) since a full scan can cover many
+        more positions than a diff-driven one -- see
+        :meth:`analyze_positions` for the memory/forward-pass trade-off.
+
+        See :func:`logit_lens_debugger.anomaly.detect_anomalies` for the signal
+        definitions and :class:`~.types.AnomalyConfig` for the weights/thresholds.
+        ``entity_spans`` are output-token-index ranges from an external NER pass
+        (see the ``entity`` signal); NER itself is out of scope for this package.
+        """
+        if only_diff and source is None:
+            raise ValueError("only_diff=True requires source")
+
+        source_tokens = (
+            self._decode_tokens(self.adapter.encode(source)) if source is not None else None
+        )
+
+        if only_diff:
+            result = self.analyze_diff(
+                source, output, prompt=prompt, top_k=top_k, context=context, chunk_size=chunk_size
+            )
+        else:
+            result = self.analyze_generation(prompt, output, top_k=top_k, chunk_size=chunk_size)
+            if source is not None:
+                output_ids = self._output_ids(output)
+                output_tokens = self._decode_tokens(output_ids)
+                spans = diff_token_sequences(source_tokens, output_tokens)
+                span_by_position = dict(
+                    select_positions(spans, result.prompt_length, len(output_ids))
+                )
+                positions = [
+                    replace(pos, diff_span=span_by_position.get(pos.token_index, pos.diff_span))
+                    for pos in result.positions
+                ]
+                result = replace(result, positions=positions, diff_spans=spans)
+
+        return _score_anomalies(result, source_tokens, config, entity_spans)
 
     # ------------------------------------------------------------------ compare
 
