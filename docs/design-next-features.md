@@ -408,3 +408,33 @@ logit-lens compare-results a.json b.json [--html]
 | 2 モデル比較のロード | 逐次ロードが既定、`sequential=False` で同時 | M2 16 GB で 1.5B クラス 2 つを同時に載せるのは厳しい |
 | NER | スコープ外、span 注入 hook のみ | 依存を増やさない。パッケージの汎用性を保つ |
 | 層数が違うモデルの対応付け | 相対深さの最近傍 | 単純で説明しやすい。補間は行わない |
+
+---
+
+## 9. 実装状況と設計からの変更点（2026-09-12 時点）
+
+全 5 機能を実装済み。実装は Sonnet のサブエージェント、仕様の詳細化・レビュー・コミット分割は Fable が担当した。
+
+| 機能 | commit | 主なファイル |
+|---|---|---|
+| 3 Layer instability | `7398a74` | `metrics.py`, CLI `metrics` |
+| 1 diff → position | `7948347` | `diff.py`, `analyze_positions` / `analyze_generation` / `analyze_diff`, CLI `diff` |
+| 2 anomaly detection | `d589d1d` | `anomaly.py`, `detect_anomalies`, CLI `scan` |
+| 4 compare 拡張 | `b647d3c` | `comparison.py`, `run_detailed`, `LayerComparison`, CLI `compare` 拡張 |
+| 5 model comparison | `1c41926` | `compare_models` / `compare_model_names`, `align_layers` / `vocab_identical`, CLI `compare-models` / `compare-results` |
+
+オフラインテストは 205 件。実モデル（Qwen2.5-0.5B / 0.5B-Instruct、MPS bf16）で `diff` / `scan` / `compare` / `compare-models` / `metrics` / `compare-results` をスモークテストし、`売上は150万円でした → 1500万円でした` の余分な `0` が anomaly スコア最上位（最終層 p=0.004）になることを確認した。
+
+設計時の仮決めから変えた点:
+
+| 論点 | 設計 | 実装 | 理由 |
+|---|---|---|---|
+| diff の拡張対象クラス | 数字 / 英字 / かな / 漢字 | 数字 / かな / 漢字（英字を除外） | HF tokenizer では単語先頭 token に空白が付き、英字を含めると隣接する単語すべてに span が広がる |
+| span 拡張の境界 | 同じクラスなら拡張 | 空白始まりの token をまたがない。insert / delete の空 range は「変更内容と同じクラスの隣接 token」だけを吸収 | `" 150 200"` のような数値の並びや、削除された数字の隣の「は」を巻き込まないため |
+| `entity_spans` | 出力の文字範囲 | 出力 token index の範囲 | 呼び出し側で `char_to_token` を使って変換できる。内部表現を token に統一 |
+| 評価できない anomaly signal | 0 として合成 | `signals` から省略し、利用可能な signal だけで重み付き平均 | target が無い position などで不当に低い / 高いスコアが付かないようにする |
+| 複数 position 解析の一致 | 単一解析と完全一致 | token id / rank / 層構造は一致、float は batched matmul の丸め差（約 1e-7）を許容 | PyTorch の CPU matmul がバッチサイズで丸めが変わる。既存の engine テストと同じ方針 |
+| `compare-results`（JSON 同士） | 語彙の同一性を判定 | JSON からは判定できないため `same_vocab=None`、header は `vocab: unknown` | 保存結果は語彙を持たない |
+| `compare_model_names` | 逐次ロード既定 | 同じ。加えて `factory` 引数でロード方法を注入可能 | テストと CLI が極小モデル / `_build_analyzer` を差し込むため |
+
+未実装（README「次に実装すると良い機能」6 番と同じ）: 文字オフセットベースの diff、chat template オプション、tuned lens、batch 対応。
