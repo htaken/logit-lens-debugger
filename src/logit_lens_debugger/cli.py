@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import typer
 
 from .analyzer import LogitLensAnalyzer
 from .types import ComparisonResult, LensMode, LogitLensResult
-from .visualization.trajectory import format_layers, format_trajectory
+from .visualization.trajectory import format_instability, format_layers, format_trajectory
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -121,6 +122,8 @@ def analyze(
     typer.echo(format_layers(result, show=show))
     typer.echo("")
     typer.echo(format_trajectory(result))
+    typer.echo("")
+    typer.echo(format_instability(result.instability()))
     _write_outputs(result, json_path, html_path)
 
 
@@ -168,6 +171,25 @@ def compare(
         )
     if json_path is not None:
         comparison.save_json(json_path)
+        typer.echo(f"Saved JSON to {json_path}")
+
+
+@app.command()
+def metrics(
+    result_json: Path = typer.Argument(..., help="Result JSON written by `analyze --json`."),
+    from_layer: int = typer.Option(1, "--from-layer", help="First layer index to evaluate."),
+    late_fraction: float = typer.Option(
+        1 / 3, "--late-fraction", help="Fraction of final layers counted as 'late'."
+    ),
+    json_path: Path | None = typer.Option(None, "--json", help="Write metrics as JSON."),
+) -> None:
+    """Compute layer instability metrics from a saved result JSON, without loading the model."""
+    result = LogitLensResult.load_json(result_json)
+    computed = result.instability(from_layer=from_layer, late_fraction=late_fraction)
+    typer.echo(format_instability(computed))
+    if json_path is not None:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(computed.to_dict(), indent=2), encoding="utf-8")
         typer.echo(f"Saved JSON to {json_path}")
 
 

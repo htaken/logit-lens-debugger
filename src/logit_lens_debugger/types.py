@@ -114,6 +114,16 @@ class LogitLensResult:
         """Top-1 prediction at each layer, in layer order."""
         return [layer.top1 for layer in self.layers]
 
+    def instability(self, **kwargs: Any) -> InstabilityMetrics:
+        """Compute layer instability metrics for this result.
+
+        See :func:`logit_lens_debugger.metrics.compute_instability`. Imported lazily
+        so this module stays importable without pulling in ``metrics.py``.
+        """
+        from .metrics import compute_instability
+
+        return compute_instability(self, **kwargs)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "model_name": self.model_name,
@@ -157,6 +167,40 @@ class LogitLensResult:
     @classmethod
     def load_json(cls, path: str | Path) -> LogitLensResult:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+@dataclass(frozen=True)
+class InstabilityMetrics:
+    """How much the top-1 trajectory of a :class:`LogitLensResult` moves across layers.
+
+    Produced by :func:`logit_lens_debugger.metrics.compute_instability`. Not part of
+    ``LogitLensResult.to_dict()``: these are derived values, always recomputable from
+    the layers, so they are never stored as ground truth.
+    """
+
+    from_layer: int
+    late_fraction: float
+    num_evaluated_layers: int
+    top1_switches: int
+    oscillations: int
+    distinct_top1: int
+    settle_layer: int
+    late_start_layer: int
+    late_switches: int
+    instability_score: float
+    target_first_top1_layer: int | None
+    target_first_topk_layer: int | None
+    target_rank_log_mean: float | None
+    target_rank_log_std: float | None
+    target_final_rank: int | None
+    target_final_prob: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> InstabilityMetrics:
+        return cls(**data)
 
 
 @dataclass

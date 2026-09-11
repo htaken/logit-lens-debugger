@@ -5,8 +5,28 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..types import LogitLensResult
+from ..types import InstabilityMetrics, LogitLensResult
 from ._theme import CATEGORICAL, base_layout, display_token, layer_label, require_plotly
+
+
+def format_instability(metrics: InstabilityMetrics) -> str:
+    """Compact plain-text summary of layer instability (see ``metrics.compute_instability``)."""
+    lines = [
+        f"Instability from layer {metrics.from_layer} "
+        f"({metrics.num_evaluated_layers} layers evaluated): score={metrics.instability_score:.2f}",
+        f"  switches={metrics.top1_switches}  oscillations={metrics.oscillations}  "
+        f"distinct={metrics.distinct_top1}  settle_layer={metrics.settle_layer}  "
+        f"late_switches={metrics.late_switches} (>= layer {metrics.late_start_layer})",
+    ]
+    if metrics.target_final_rank is not None:
+        lines.append(
+            f"  target: first top-1 at layer {metrics.target_first_top1_layer}, "
+            f"first top-k at layer {metrics.target_first_topk_layer}, "
+            f"final rank={metrics.target_final_rank} p={metrics.target_final_prob:.3f}, "
+            f"log2(rank) mean={metrics.target_rank_log_mean:.2f} "
+            f"std={metrics.target_rank_log_std:.2f}"
+        )
+    return "\n".join(lines)
 
 
 def format_trajectory(result: LogitLensResult) -> str:

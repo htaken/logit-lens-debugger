@@ -10,6 +10,7 @@ import torch
 
 from logit_lens_debugger import LogitLensAnalyzer
 from logit_lens_debugger.adapters import adapter_for_model
+from logit_lens_debugger.types import LayerResult, LensMode, LogitLensResult, TokenPrediction
 
 VOCAB = [
     "<unk>",
@@ -124,3 +125,56 @@ def analyzer(qwen_adapter) -> LogitLensAnalyzer:
 @pytest.fixture
 def sample_result(analyzer):
     return analyzer.analyze("the capital of japan is tokyo", token_index=4, top_k=5)
+
+
+def make_result(
+    top1_ids: list[int],
+    target_ranks: list[int] | None = None,
+    top_k: int = 3,
+    target_token_id: int | None = None,
+) -> LogitLensResult:
+    """Build a synthetic ``LogitLensResult`` from a top-1 id sequence, for metrics tests.
+
+    ``target_ranks[i]`` (if given) becomes ``layers[i].target.rank``; probability is a
+    simple decreasing function of rank. Token strings are ``f"t{token_id}"``.
+    """
+    if target_ranks is not None and target_token_id is None:
+        target_token_id = 9000  # arbitrary id, distinct from the dummy fill ids below
+
+    layers = []
+    for i, top1_id in enumerate(top1_ids):
+        fill_ids = [top1_id] + [-(i * top_k + j) - 1 for j in range(top_k - 1)]
+        top_tokens = [
+            TokenPrediction(
+                token=f"t{tok_id}",
+                token_id=tok_id,
+                logit=float(top_k - rank),
+                probability=max(0.01, 1.0 - 0.1 * rank),
+                rank=rank + 1,
+            )
+            for rank, tok_id in enumerate(fill_ids)
+        ]
+        target = None
+        if target_ranks is not None:
+            rank = target_ranks[i]
+            target = TokenPrediction(
+                token=f"t{target_token_id}",
+                token_id=target_token_id,
+                logit=1.0,
+                probability=1.0 / rank,
+                rank=rank,
+            )
+        layers.append(LayerResult(layer_index=i, top_tokens=top_tokens, target=target))
+
+    return LogitLensResult(
+        model_name="synthetic",
+        lens_mode=LensMode.FINAL_NORM,
+        text="synthetic",
+        input_tokens=["synthetic"],
+        input_token_ids=[0],
+        token_index=0,
+        top_k=top_k,
+        layers=layers,
+        target_token=f"t{target_token_id}" if target_token_id is not None else None,
+        target_token_id=target_token_id,
+    )

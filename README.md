@@ -146,6 +146,9 @@ uv run logit-lens compare --model Qwen/Qwen2.5-0.5B \
 # 保存済み JSON からモデルをロードせずに可視化を再生成する
 uv run logit-lens visualize outputs/qa.json --html outputs/qa_heatmap.html --kind heatmap
 uv run logit-lens visualize outputs/qa.json --html outputs/qa_traj.html --kind trajectory
+
+# 保存済み JSON から layer instability を計算する（モデル不要）
+uv run logit-lens metrics outputs/qa.json --from-layer 1 --json outputs/qa_metrics.json
 ```
 
 ### Python API
@@ -228,6 +231,41 @@ cmp.first_divergence_layer  # 最初に分岐した layer（None なら全 layer
 cmp.divergence_layers       # 分岐した layer の一覧
 ```
 
+#### Layer instability（予測の不安定さ）
+
+`result.trajectory()` の top-1 が layer をまたいでどれだけ入れ替わるかを 1 つのスコアにまとめます。モデル・tokenizer は不要で、`LogitLensResult`（JSON から復元したものでも可）だけから計算できる純関数です。
+
+```python
+metrics = result.instability()          # from_layer=1（既定）, late_fraction=1/3
+
+# もしくはモジュール関数として
+from logit_lens_debugger import compute_instability
+metrics = compute_instability(result, from_layer=1, late_fraction=1 / 3)
+
+metrics.instability_score   # [0, 1] にクリップ済み
+metrics.settle_layer        # これ以降ずっと最終 layer と同じ top-1 になる最初の layer
+```
+
+| フィールド | 内容 |
+|---|---|
+| `top1_switches` | 隣接 layer 間で top-1 の token が変わった回数 |
+| `oscillations` | 一度離れた token に top-1 が戻った回数（`A→B→A→B` なら 2） |
+| `distinct_top1` | top-1 に現れた token の種類数 |
+| `settle_layer` | それ以降ずっと最終 layer と同じ top-1 になる最初の layer |
+| `late_switches` / `late_start_layer` | 後半（既定: 末尾 1/3）で起きた switch の回数と、その境界となる layer |
+| `instability_score` | 上記を `[0, 1]` に正規化したスコア |
+| `target_first_top1_layer` / `target_first_topk_layer` | target が初めて top-1 / top-k に入った layer（target 追跡時のみ、それ以外は `None`） |
+| `target_rank_log_mean` / `target_rank_log_std` | 各 layer の `log2(rank)` の平均・母標準偏差（target 追跡時のみ） |
+| `target_final_rank` / `target_final_prob` | 最終 layer での target の rank / probability（target 追跡時のみ） |
+
+CLI からはモデルをロードせず、保存済み JSON だけで計算できます。
+
+```bash
+uv run logit-lens metrics outputs/qa.json --from-layer 1 --json outputs/qa_metrics.json
+```
+
+> **注意**: 小規模モデルの前半〜中盤 layer では top-1 が不安定なのが常態です。`instability_score` は「どの position を詳しく調べるか」の優先順位付けのための heuristics であり、それ単独で問題の原因を示す証拠ではありません。
+
 #### 可視化
 
 ```python
@@ -299,8 +337,9 @@ Hugging Face Transformers
 | `src/logit_lens_debugger/adapters/registry.py` | `config.model_type` → adapter の解決、`load_adapter` / `register_adapter` |
 | `src/logit_lens_debugger/engine.py` | Logit Lens 本体 |
 | `src/logit_lens_debugger/analyzer.py` | 高レベル API |
+| `src/logit_lens_debugger/metrics.py` | `compute_instability()` → `InstabilityMetrics`（torch 非依存、JSON からも計算可） |
 | `src/logit_lens_debugger/visualization/` | ヒートマップ・trajectory（Plotly）とテキスト整形 |
-| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `visualize`） |
+| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `metrics` / `visualize`） |
 | `tests/` | 極小ランダム初期化モデルによるオフラインテスト + opt-in の実モデル統合テスト |
 | `examples/basic_analysis.py` | API の最小サンプル |
 
@@ -360,7 +399,7 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 
 1. **Input / Output diff → 対象 position の自動選択**（要件 9.1）: 原文と LLM 出力の差分から怪しい生成 token の位置を求め、`LogitLensEngine.run(input_ids, positions=[...])` に渡す。複数 position の一括解析は既に対応済み。
 2. **自動 anomaly detection**（9.2）: `LayerResult.entropy` と `layer.target.rank` の推移が既に記録されているので、「最終層直前まで target の rank が低い」「entropy が高い」token をスコアリングする。
-3. **Layer instability スコア**（9.3）: `result.trajectory()` の top-1 切り替わり回数や、target rank の分散から算出する。
+3. ~~Layer instability スコア~~ → 実装済み（`metrics.py`）
 4. **Prompt comparison の拡張**（9.4）: `compare()` を position 対応付け付きに拡張し、top-1 一致だけでなく layer ごとの KL divergence や target rank 差を出す。
 5. **Model comparison**（9.5）: 2 つの `LogitLensAnalyzer` の結果を同じ `ComparisonResult` 形式で並べる。
 6. **chat template オプション**、**tuned lens**、**batch 対応**。

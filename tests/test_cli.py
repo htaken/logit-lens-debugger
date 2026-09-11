@@ -61,6 +61,7 @@ def test_analyze_command(patched_cli, tmp_path):
     assert "Layer 3" in result.output
     assert "<-- analyzed" in result.output
     assert "Top-1 trajectory (raw lens)" in result.output
+    assert "Instability from layer" in result.output
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["lens_mode"] == "raw"
     assert payload["token_index"] == 4
@@ -102,6 +103,20 @@ def test_compare_command(patched_cli, tmp_path):
     assert "diverges at layer" in result.output or "agree at every layer" in result.output
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert len(payload["top1_agreement"]) == 4
+
+
+def test_metrics_command(sample_result, tmp_path):
+    json_path = sample_result.save_json(tmp_path / "result.json")
+    out_path = tmp_path / "metrics.json"
+    result = runner.invoke(
+        cli.app,
+        ["metrics", str(json_path), "--from-layer", "1", "--json", str(out_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Instability from layer 1" in result.output
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    expected = sample_result.instability(from_layer=1)
+    assert payload == expected.to_dict()
 
 
 def test_visualize_from_json(sample_result, tmp_path):

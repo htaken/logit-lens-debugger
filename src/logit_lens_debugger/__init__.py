@@ -12,13 +12,22 @@ from .adapters import (
 )
 from .analyzer import LogitLensAnalyzer
 from .engine import LogitLensEngine
-from .types import ComparisonResult, LayerResult, LensMode, LogitLensResult, TokenPrediction
+from .metrics import compute_instability
+from .types import (
+    ComparisonResult,
+    InstabilityMetrics,
+    LayerResult,
+    LensMode,
+    LogitLensResult,
+    TokenPrediction,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "ComparisonResult",
     "HFCausalLMAdapter",
+    "InstabilityMetrics",
     "LayerResult",
     "LensMode",
     "LlamaAdapter",
@@ -31,6 +40,7 @@ __all__ = [
     "UnsupportedModelError",
     "__version__",
     "adapter_for_model",
+    "compute_instability",
     "load_adapter",
     "register_adapter",
 ]
