@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import torch
 
 from .adapters.base import ModelAdapter
 from .adapters.registry import load_adapter
+from .diff import diff_token_sequences, select_positions
 from .engine import LogitLensEngine
-from .types import ComparisonResult, LensMode, LogitLensResult
+from .types import ComparisonResult, LensMode, LogitLensResult, MultiPositionResult, PositionResult
 
 
 def normalize_index(index: int, length: int) -> int:
@@ -118,6 +121,206 @@ class LogitLensAnalyzer:
                 stacklevel=3,
             )
         return ids[0]
+
+    # ------------------------------------------------------------- multi-position
+
+    def analyze_positions(
+        self,
+        text: str | Sequence[int],
+        positions: Sequence[int],
+        top_k: int = 10,
+        targets: Sequence[int | str | None] | None = None,
+        prompt_length: int = 0,
+        chunk_size: int | None = None,
+    ) -> MultiPositionResult:
+        """Run the lens over several token positions of one context in one (or few) forwards.
+
+        ``text`` may be a string (tokenized with the adapter) or an already-built id
+        sequence, so callers that assembled a context themselves (e.g. prompt +
+        generated output) can pass it straight through. ``positions`` are
+        normalized (negative indices allowed), deduplicated and sorted ascending.
+
+        Each position's target defaults to the token that actually follows it in
+        the context; pass ``targets`` (same length as ``positions``, matched by
+        original order) to override per position -- ``None`` entries keep the
+        default, ints are used as-is, strings are resolved like ``analyze``'s
+        ``target_token``.
+
+        ``chunk_size`` trades memory for extra forward passes: ``None`` runs the
+        engine once for all positions; otherwise positions are split into chunks
+        of that size, each requiring its own forward. Results are identical either
+        way.
+        """
+        if not positions:
+            raise ValueError("positions must not be empty")
+
+        ids: list[int] = (
+            self.adapter.tokenize(text)[0].tolist() if isinstance(text, str) else list(text)
+        )
+        length = len(ids)
+        normalized = [normalize_index(p, length) for p in positions]
+
+        if targets is None:
+            target_requests: Sequence[int | str | None] = [None] * len(positions)
+        else:
+            target_requests = targets
+            if len(target_requests) != len(positions):
+                raise ValueError(
+                    f"targets has {len(target_requests)} entries, expected {len(positions)} "
+                    "(one per position)"
+                )
+
+        by_position: dict[int, int | str | None] = {}
+        for pos, treq in zip(normalized, target_requests, strict=True):
+            by_position.setdefault(pos, treq)
+        sorted_positions = sorted(by_position)
+
+        target_ids: list[int | None] = []
+        for pos in sorted_positions:
+            treq = by_position[pos]
+            if treq is None:
+                target_ids.append(ids[pos + 1] if pos + 1 < length else None)
+            else:
+                target_ids.append(self._resolve_target(treq))
+
+        input_tensor = torch.tensor([ids], dtype=torch.long, device=self.adapter.device)
+        if chunk_size is None:
+            layers_by_position = self.engine.run(
+                input_tensor, sorted_positions, top_k=top_k, target_token_id=target_ids
+            )
+        else:
+            layers_by_position = []
+            for start in range(0, len(sorted_positions), chunk_size):
+                chunk_positions = sorted_positions[start : start + chunk_size]
+                chunk_targets = target_ids[start : start + chunk_size]
+                layers_by_position.extend(
+                    self.engine.run(
+                        input_tensor, chunk_positions, top_k=top_k, target_token_id=chunk_targets
+                    )
+                )
+
+        position_results = [
+            PositionResult(
+                token_index=pos,
+                layers=layers,
+                target_token=self.adapter.decode_token(tid) if tid is not None else None,
+                target_token_id=tid,
+            )
+            for pos, layers, tid in zip(
+                sorted_positions, layers_by_position, target_ids, strict=True
+            )
+        ]
+
+        return MultiPositionResult(
+            model_name=self.model_name,
+            lens_mode=self.lens_mode,
+            text=self.adapter.decode(ids),
+            input_tokens=[self.adapter.decode_token(i) for i in ids],
+            input_token_ids=ids,
+            prompt_length=prompt_length,
+            top_k=top_k,
+            positions=position_results,
+            metadata={"device": str(self.adapter.device)},
+        )
+
+    def analyze_generation(
+        self,
+        prompt: str,
+        output: str | Sequence[int],
+        top_k: int = 10,
+        positions: Sequence[int] | None = None,
+        chunk_size: int | None = None,
+    ) -> MultiPositionResult:
+        """Analyze the residual stream that produced each (or select) token of ``output``.
+
+        ``prompt`` and ``output`` are tokenized *separately* and concatenated so
+        the id sequence matches a real generation exactly -- tokenizing the joined
+        string could merge tokens across the prompt/output boundary and no longer
+        match what was actually generated. Pass ``output`` as an id sequence to
+        replay a generation log exactly; a string is encoded without special tokens.
+        """
+        prompt_ids: list[int] = self.adapter.tokenize(prompt)[0].tolist()
+        output_ids = self.adapter.encode(output) if isinstance(output, str) else list(output)
+        context_ids = prompt_ids + output_ids
+        prompt_length = len(prompt_ids)
+
+        js = range(len(output_ids)) if positions is None else positions
+        resolved_positions = [prompt_length + j - 1 for j in js]
+        resolved_positions = [p for p in resolved_positions if p >= 0]
+
+        return self.analyze_positions(
+            context_ids,
+            resolved_positions,
+            top_k=top_k,
+            prompt_length=prompt_length,
+            chunk_size=chunk_size,
+        )
+
+    def analyze_diff(
+        self,
+        source: str,
+        output: str | Sequence[int],
+        prompt: str | None = None,
+        top_k: int = 10,
+        context: int = 0,
+        expand_spans: bool = True,
+        include_after_delete: bool = True,
+        chunk_size: int | None = None,
+    ) -> MultiPositionResult:
+        """Diff ``source`` against ``output`` and analyze only the flagged positions.
+
+        ``prompt`` is the text actually given to the model; when omitted, ``source``
+        stands in for it (an approximation: the model saw the source and produced
+        ``output``, so the source itself becomes the context). The diff is computed
+        over each token's decoded string (see :mod:`.diff`), not character offsets,
+        so it needs no fast-tokenizer support and works for languages without
+        whitespace. If the token sequences are identical, no positions are analyzed
+        and the engine is never invoked.
+        """
+        prompt_text = source if prompt is None else prompt
+        prompt_ids: list[int] = self.adapter.tokenize(prompt_text)[0].tolist()
+        output_ids = self.adapter.encode(output) if isinstance(output, str) else list(output)
+        context_ids = prompt_ids + output_ids
+        prompt_length = len(prompt_ids)
+
+        source_tokens = [self.adapter.decode_token(i) for i in self.adapter.encode(source)]
+        output_tokens = [self.adapter.decode_token(i) for i in output_ids]
+        spans = diff_token_sequences(source_tokens, output_tokens, expand_spans=expand_spans)
+        pairs = select_positions(
+            spans,
+            prompt_length,
+            len(output_ids),
+            context=context,
+            include_after_delete=include_after_delete,
+        )
+
+        if not pairs:
+            return MultiPositionResult(
+                model_name=self.model_name,
+                lens_mode=self.lens_mode,
+                text=self.adapter.decode(context_ids),
+                input_tokens=[self.adapter.decode_token(i) for i in context_ids],
+                input_token_ids=context_ids,
+                prompt_length=prompt_length,
+                top_k=top_k,
+                positions=[],
+                diff_spans=spans,
+                metadata={"device": str(self.adapter.device)},
+            )
+
+        span_by_position = dict(pairs)
+        result = self.analyze_positions(
+            context_ids,
+            list(span_by_position),
+            top_k=top_k,
+            prompt_length=prompt_length,
+            chunk_size=chunk_size,
+        )
+        positions_with_spans = [
+            replace(pos_result, diff_span=span_by_position.get(pos_result.token_index))
+            for pos_result in result.positions
+        ]
+        return replace(result, positions=positions_with_spans, diff_spans=spans)
 
     # ------------------------------------------------------------------ compare
 

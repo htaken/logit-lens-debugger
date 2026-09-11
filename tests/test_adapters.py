@@ -106,6 +106,10 @@ def test_tokenizer_helpers(qwen_adapter):
     assert qwen_adapter.encode("tokyo") == [6]
 
 
+def test_decode_multiple_tokens(qwen_adapter):
+    assert qwen_adapter.decode([1, 2]) == "the capital"
+
+
 def test_resolve_device_and_dtype():
     assert resolve_device("cpu") == torch.device("cpu")
     assert resolve_device(None).type in {"cpu", "cuda", "mps"}

@@ -99,6 +99,15 @@ class ModelAdapter(ABC):
     def encode(self, text: str) -> list[int]:
         """Token ids for ``text`` without special tokens (used to resolve target tokens)."""
 
+    def decode(self, token_ids: Sequence[int]) -> str:
+        """Human-readable text for a sequence of token ids.
+
+        Default implementation joins the per-token decodes; subclasses may
+        override with the tokenizer's own multi-token decode (which can differ,
+        e.g. by not inserting spaces between sub-word pieces).
+        """
+        return "".join(self.decode_token(i) for i in token_ids)
+
 
 class HFCausalLMAdapter(ModelAdapter):
     """Shared implementation for Hugging Face decoder-only models.
@@ -240,3 +249,6 @@ class HFCausalLMAdapter(ModelAdapter):
 
     def encode(self, text: str) -> list[int]:
         return list(self.tokenizer.encode(text, add_special_tokens=False))
+
+    def decode(self, token_ids: Sequence[int]) -> str:
+        return self.tokenizer.decode(list(token_ids))

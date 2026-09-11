@@ -170,6 +170,182 @@ class LogitLensResult:
 
 
 @dataclass(frozen=True)
+class DiffSpan:
+    """One contiguous span where a source and output token sequence differ.
+
+    Ranges are ``[start, end)`` token indices into the respective sequence.
+    ``kind`` is ``"replace"`` (both ranges non-empty), ``"insert"`` (source empty)
+    or ``"delete"`` (output empty). See :mod:`.diff`.
+    """
+
+    kind: str
+    source_range: tuple[int, int]
+    output_range: tuple[int, int]
+    source_text: str
+    output_text: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "source_range": list(self.source_range),
+            "output_range": list(self.output_range),
+            "source_text": self.source_text,
+            "output_text": self.output_text,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DiffSpan:
+        return cls(
+            kind=data["kind"],
+            source_range=tuple(data["source_range"]),
+            output_range=tuple(data["output_range"]),
+            source_text=data["source_text"],
+            output_text=data["output_text"],
+        )
+
+
+@dataclass
+class PositionResult:
+    """Lens trajectory for one token position, without the shared context fields.
+
+    Used inside :class:`MultiPositionResult`, which carries ``input_tokens`` once
+    for every analyzed position instead of duplicating it per position.
+    """
+
+    token_index: int
+    layers: list[LayerResult]
+    target_token: str | None = None
+    target_token_id: int | None = None
+    diff_span: DiffSpan | None = None
+
+    def trajectory(self) -> list[TokenPrediction]:
+        """Top-1 prediction at each layer, in layer order."""
+        return [layer.top1 for layer in self.layers]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "token_index": self.token_index,
+            "layers": [layer.to_dict() for layer in self.layers],
+            "target_token": self.target_token,
+            "target_token_id": self.target_token_id,
+            "diff_span": self.diff_span.to_dict() if self.diff_span is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PositionResult:
+        diff_span = data.get("diff_span")
+        return cls(
+            token_index=data["token_index"],
+            layers=[LayerResult.from_dict(layer) for layer in data["layers"]],
+            target_token=data.get("target_token"),
+            target_token_id=data.get("target_token_id"),
+            diff_span=DiffSpan.from_dict(diff_span) if diff_span is not None else None,
+        )
+
+
+@dataclass
+class MultiPositionResult:
+    """Several analyzed positions of one context (one shared forward pass).
+
+    ``prompt_length`` is the index of the first output token in
+    ``input_token_ids`` (0 if the context has no prompt prefix).
+    """
+
+    model_name: str
+    lens_mode: LensMode
+    text: str
+    input_tokens: list[str]
+    input_token_ids: list[int]
+    prompt_length: int
+    top_k: int
+    positions: list[PositionResult]
+    diff_spans: list[DiffSpan] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def num_layers(self) -> int:
+        if not self.positions:
+            raise ValueError("num_layers is undefined: positions is empty")
+        return len(self.positions[0].layers) - 1
+
+    @property
+    def output_tokens(self) -> list[str]:
+        return self.input_tokens[self.prompt_length :]
+
+    def to_results(self) -> list[LogitLensResult]:
+        """Expand each position into a standalone :class:`LogitLensResult`.
+
+        Lets the existing per-result visualizations and metrics be reused without
+        a ``MultiPositionResult``-specific code path.
+        """
+        results = []
+        for pos in self.positions:
+            metadata = {
+                **self.metadata,
+                "prompt_length": self.prompt_length,
+                "diff_span": pos.diff_span.to_dict() if pos.diff_span is not None else None,
+            }
+            results.append(
+                LogitLensResult(
+                    model_name=self.model_name,
+                    lens_mode=self.lens_mode,
+                    text=self.text,
+                    input_tokens=list(self.input_tokens),
+                    input_token_ids=list(self.input_token_ids),
+                    token_index=pos.token_index,
+                    top_k=self.top_k,
+                    layers=pos.layers,
+                    target_token=pos.target_token,
+                    target_token_id=pos.target_token_id,
+                    metadata=metadata,
+                )
+            )
+        return results
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "lens_mode": self.lens_mode.value,
+            "text": self.text,
+            "input_tokens": list(self.input_tokens),
+            "input_token_ids": list(self.input_token_ids),
+            "prompt_length": self.prompt_length,
+            "top_k": self.top_k,
+            "positions": [p.to_dict() for p in self.positions],
+            "diff_spans": [s.to_dict() for s in self.diff_spans],
+            "metadata": dict(self.metadata),
+        }
+
+    def to_json(self, indent: int | None = 2) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=indent)
+
+    def save_json(self, path: str | Path) -> Path:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_json(), encoding="utf-8")
+        return path
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MultiPositionResult:
+        return cls(
+            model_name=data["model_name"],
+            lens_mode=LensMode(data["lens_mode"]),
+            text=data["text"],
+            input_tokens=list(data["input_tokens"]),
+            input_token_ids=list(data["input_token_ids"]),
+            prompt_length=data["prompt_length"],
+            top_k=data["top_k"],
+            positions=[PositionResult.from_dict(p) for p in data["positions"]],
+            diff_spans=[DiffSpan.from_dict(s) for s in data.get("diff_spans", [])],
+            metadata=dict(data.get("metadata", {})),
+        )
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> MultiPositionResult:
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+@dataclass(frozen=True)
 class InstabilityMetrics:
     """How much the top-1 trajectory of a :class:`LogitLensResult` moves across layers.
 

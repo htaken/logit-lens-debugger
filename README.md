@@ -149,6 +149,11 @@ uv run logit-lens visualize outputs/qa.json --html outputs/qa_traj.html --kind t
 
 # 保存済み JSON から layer instability を計算する（モデル不要）
 uv run logit-lens metrics outputs/qa.json --from-layer 1 --json outputs/qa_metrics.json
+
+# 原文と出力の diff から怪しい token position を自動選択して解析する
+uv run logit-lens diff --model Qwen/Qwen2.5-0.5B \
+  --source "売上は150万円でした" --output "売上は1500万円でした" \
+  --context 1 --json outputs/diff.json --html-dir outputs/diff_html
 ```
 
 ### Python API
@@ -266,6 +271,95 @@ uv run logit-lens metrics outputs/qa.json --from-layer 1 --json outputs/qa_metri
 
 > **注意**: 小規模モデルの前半〜中盤 layer では top-1 が不安定なのが常態です。`instability_score` は「どの position を詳しく調べるか」の優先順位付けのための heuristics であり、それ単独で問題の原因を示す証拠ではありません。
 
+#### 原文と生成結果の diff から対象 position を自動選択する
+
+音声認識のテキスト化 → LLM で要約・整形、のようなパイプラインでは「どの token を調べればよいか」が最初の問題です。`analyzer.analyze_diff()` は原文（`source`）と出力（`output`）を **モデルの tokenizer で** それぞれ tokenize し、token 文字列の列同士を `difflib` で比較して、変化した箇所だけを解析対象にします。
+
+```python
+result = analyzer.analyze_diff(
+    source="売上は150万円でした",
+    output="売上は1500万円でした",
+    top_k=10,
+    context=1,       # 変化箇所の前後 n token も解析対象に加える
+)
+
+for span in result.diff_spans:
+    span.kind, span.source_text, span.output_text   # "replace", "150", "1500"
+
+for pos in result.positions:
+    pos.token_index      # 解析した residual stream position
+    pos.target_token      # そこで実際に出力された token（"1500" 側の断片）
+    pos.diff_span         # この position の元になった DiffSpan
+```
+
+Qwen の tokenizer は数字を 1 桁ずつ token 化するため（`1500` → `1`,`5`,`0`,`0`）、素の diff だと `0` が 1 個 insert されただけに見えます。`expand_spans=True`（既定）は同じ文字クラス（数字 / かな / 漢字。英字は対象外 -- 実際の tokenizer では単語の先頭 token が空白付き（`" sales"` のような形）になるため、英字まで対象にすると文全体まで広がってしまいます）の隣接 token をまとめて span を数値全体に広げます。ただし空白始まりの token（新しい単語の先頭）をまたいでは広げません（`" 2024"` の直後の `" 150"` が別の数値として保たれるのはこのためです）。
+
+`prompt` を省略すると `source` がそのまま「モデルに実際に渡した文脈」として使われます（近似: 「モデルは原文を見てこの出力をした」とみなす）。実際に渡したプロンプトが別にある場合は `prompt=` で指定してください。
+
+```python
+result = analyzer.analyze_diff(
+    source=transcript,
+    output=llm_output,
+    prompt=f"次の文字起こしを要約してください:\n{transcript}",
+)
+```
+
+`prompt` と `output` は **別々に tokenize してから連結** します。連結後の文字列をまとめて tokenize すると、境界で token が結合されて実際の生成 token 列とずれることがあるためです（`output` を生成時の id 列で渡せば生成ログを厳密に再現できます）。
+
+もっと直接的に位置を指定したい場合は次の 2 つも使えます。
+
+```python
+# prompt + 生成結果（id 列 or 文字列）から、生成された token ごとに解析する
+analyzer.analyze_generation(prompt="the capital of japan is", output="tokyo osaka")
+
+# 既に分かっている position 集合を 1 回の forward でまとめて解析する
+analyzer.analyze_positions("the capital of japan is tokyo", positions=[2, 4])
+```
+
+いずれも `MultiPositionResult` を返します（1 つの文脈に対する複数 position 分の結果を、`input_tokens` を重複させずにまとめたもの）。
+
+| フィールド | 内容 |
+|---|---|
+| `text` / `input_tokens` / `input_token_ids` | 解析した文脈全体（prompt + output） |
+| `prompt_length` | `input_token_ids` のうち output が始まる index |
+| `positions` | `PositionResult` のリスト（`token_index` / `layers` / `target_token` / `diff_span`） |
+| `diff_spans` | `analyze_diff` が検出した `DiffSpan` の一覧（`analyze_positions` / `analyze_generation` では空） |
+| `output_tokens` | `input_tokens[prompt_length:]` |
+| `to_results()` | 各 position を独立した `LogitLensResult` に展開する（既存の可視化・`instability()` をそのまま使うため） |
+
+```python
+for single in result.to_results():
+    print(single.instability().instability_score)
+    export_heatmap_html(single, f"outputs/position_{single.token_index}.html")
+```
+
+JSON の形（抜粋）:
+
+```json
+{
+  "prompt_length": 4,
+  "positions": [
+    {
+      "token_index": 5,
+      "target_token": "1500",
+      "diff_span": {"kind": "replace", "source_text": "150", "output_text": "1500",
+                     "source_range": [2, 3], "output_range": [2, 3]},
+      "layers": ["... LayerResult と同じ形 ..."]
+    }
+  ],
+  "diff_spans": ["... DiffSpan ..."]
+}
+```
+
+CLI からも同じことができます（`--html-dir` で position ごとにヒートマップを書き出せます）。
+
+```bash
+uv run logit-lens diff --source "sales were 150 yen" --output "sales were 1500 yen" \
+  --context 1 --json outputs/diff.json --html-dir outputs/diff_html
+```
+
+> **制約**: diff は token 列ベースなので、出力が原文を大幅に言い換えている場合は span がほぼ全域になり絞り込みの効果が薄れます。文字オフセットベースの diff は未実装です。
+
 #### 可視化
 
 ```python
@@ -335,11 +429,12 @@ Hugging Face Transformers
 | `src/logit_lens_debugger/adapters/base.py` | `ModelAdapter` ABC と `HFCausalLMAdapter`、device / dtype 解決 |
 | `src/logit_lens_debugger/adapters/qwen.py`, `llama.py` | ファミリー別 adapter（`supported_model_types` を宣言） |
 | `src/logit_lens_debugger/adapters/registry.py` | `config.model_type` → adapter の解決、`load_adapter` / `register_adapter` |
-| `src/logit_lens_debugger/engine.py` | Logit Lens 本体 |
-| `src/logit_lens_debugger/analyzer.py` | 高レベル API |
+| `src/logit_lens_debugger/engine.py` | Logit Lens 本体（position ごとに別 target も指定可能） |
+| `src/logit_lens_debugger/analyzer.py` | 高レベル API（`analyze_positions` / `analyze_generation` / `analyze_diff` を含む） |
 | `src/logit_lens_debugger/metrics.py` | `compute_instability()` → `InstabilityMetrics`（torch 非依存、JSON からも計算可） |
+| `src/logit_lens_debugger/diff.py` | `diff_token_sequences()` / `select_positions()` / `token_class()`（torch 非依存、diff から対象 position を選ぶ） |
 | `src/logit_lens_debugger/visualization/` | ヒートマップ・trajectory（Plotly）とテキスト整形 |
-| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `metrics` / `visualize`） |
+| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `diff` / `metrics` / `visualize`） |
 | `tests/` | 極小ランダム初期化モデルによるオフラインテスト + opt-in の実モデル統合テスト |
 | `examples/basic_analysis.py` | API の最小サンプル |
 
@@ -386,10 +481,11 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 
 ## 現在の制約
 
-- 1 回の解析は 1 テキスト・batch size 1 です。
+- 1 回の解析は 1 テキスト・batch size 1 です（ただし `analyze_positions` / `analyze_generation` / `analyze_diff` なら、同じテキストの複数 position を 1 回の forward でまとめて解析できます）。
 - chat template は適用しません。Instruct モデルを解析する場合は、実際にモデルへ渡した形式（template 適用後の文字列）を `--text` に渡してください。
 - 中間 layer の予測は解釈しづらいことが多く（前述）、tuned lens のような学習済み射影は未実装です。
-- Qwen の tokenizer は数字を 1 桁ずつ token 化します（`150` → `1`,`5`,`0`）。数値の書き換えを追う場合は複数 position をまたいで見る必要があります。
+- Qwen の tokenizer は数字を 1 桁ずつ token 化します（`150` → `1`,`5`,`0`）。数値の書き換えを追う場合は複数 position をまたいで見る必要があります（`analyze_diff` は同じ文字クラスの隣接 token をまとめる `expand_spans` でこれに対応しています）。
+- diff（`analyze_diff` / `logit-lens diff`）は tokenizer の token 列ベースの比較です。出力が原文の大幅な言い換え・順序入替の場合は span がほぼ全域になり、絞り込みの効果が薄れます。文字オフセットベースの diff は未実装です。
 - Llama は実 checkpoint での検証を行っていません。MoE や非標準レイアウト（`model.model.norm` / `lm_head` 以外に norm や head があるモデル）は未対応です。
 - 可視化は HTML export のみで、ライトテーマ固定です。
 
@@ -397,7 +493,7 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 
 設計上は以下を後付けしやすくしています。
 
-1. **Input / Output diff → 対象 position の自動選択**（要件 9.1）: 原文と LLM 出力の差分から怪しい生成 token の位置を求め、`LogitLensEngine.run(input_ids, positions=[...])` に渡す。複数 position の一括解析は既に対応済み。
+1. ~~Input / Output diff → 対象 position の自動選択~~ → 実装済み（`diff.py`、`analyzer.analyze_diff()` / `analyze_generation()` / `analyze_positions()`、CLI `diff` コマンド）
 2. **自動 anomaly detection**（9.2）: `LayerResult.entropy` と `layer.target.rank` の推移が既に記録されているので、「最終層直前まで target の rank が低い」「entropy が高い」token をスコアリングする。
 3. ~~Layer instability スコア~~ → 実装済み（`metrics.py`）
 4. **Prompt comparison の拡張**（9.4）: `compare()` を position 対応付け付きに拡張し、top-1 一致だけでなく layer ごとの KL divergence や target rank 差を出す。

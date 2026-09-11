@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..types import InstabilityMetrics, LogitLensResult
+from ..types import DiffSpan, InstabilityMetrics, LogitLensResult, MultiPositionResult
 from ._theme import CATEGORICAL, base_layout, display_token, layer_label, require_plotly
 
 
@@ -65,6 +65,56 @@ def format_layers(result: LogitLensResult, show: int | None = None) -> str:
             )
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)
+
+
+def format_diff_spans(result: MultiPositionResult) -> str:
+    """Plain-text listing of ``result.diff_spans``, one line per span (see ``diff.py``)."""
+    positions_by_span: dict[DiffSpan, list[int]] = {}
+    for pos in result.positions:
+        if pos.diff_span is not None:
+            positions_by_span.setdefault(pos.diff_span, []).append(pos.token_index)
+
+    lines = [f"Diff spans ({len(result.diff_spans)}):"]
+    for span in result.diff_spans:
+        positions = positions_by_span.get(span, [])
+        positions_str = " ".join(str(p) for p in positions) if positions else "-"
+        lines.append(
+            f"  [{span.kind}] source {display_token(span.source_text)} -> "
+            f"output {display_token(span.output_text)}  "
+            f"output tokens [{span.output_range[0]}, {span.output_range[1]}) "
+            f"positions {positions_str}"
+        )
+    return "\n".join(lines)
+
+
+def format_position_summary(result: MultiPositionResult) -> str:
+    """Two-line-per-position summary: target rank/probability, settle layer, instability,
+    and a compressed top-1 trajectory (only layers where the top-1 token changes)."""
+    lines = []
+    for single in result.to_results():
+        metrics = single.instability()
+        output_index = single.token_index - result.prompt_length + 1
+        target = display_token(single.target_token) if single.target_token is not None else "none"
+        final_target = single.layers[-1].target
+        detail = (
+            f" final p={final_target.probability:.3f} rank={final_target.rank}"
+            if final_target is not None
+            else ""
+        )
+        lines.append(
+            f"Position {single.token_index} (output token {output_index} {target}): "
+            f"target {target}{detail}; settle layer {metrics.settle_layer}, "
+            f"instability {metrics.instability_score:.2f}"
+        )
+        trajectory_parts = []
+        previous_id = None
+        for layer in single.layers:
+            top1 = layer.top1
+            if top1.token_id != previous_id:
+                trajectory_parts.append(f"layer {layer.layer_index} {display_token(top1.token)}")
+                previous_id = top1.token_id
+        lines.append("  " + " -> ".join(trajectory_parts))
+    return "\n".join(lines)
 
 
 def build_trajectory_figure(result: LogitLensResult, title: str | None = None) -> Any:

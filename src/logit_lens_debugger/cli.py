@@ -9,7 +9,13 @@ import typer
 
 from .analyzer import LogitLensAnalyzer
 from .types import ComparisonResult, LensMode, LogitLensResult
-from .visualization.trajectory import format_instability, format_layers, format_trajectory
+from .visualization.trajectory import (
+    format_diff_spans,
+    format_instability,
+    format_layers,
+    format_position_summary,
+    format_trajectory,
+)
 
 DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
@@ -172,6 +178,109 @@ def compare(
     if json_path is not None:
         comparison.save_json(json_path)
         typer.echo(f"Saved JSON to {json_path}")
+
+
+@app.command()
+def diff(
+    source: str | None = typer.Option(None, "--source", help="Original/source text."),
+    source_file: Path | None = typer.Option(
+        None, "--source-file", help="Read source text from a file."
+    ),
+    output: str | None = typer.Option(None, "--output", help="Model output text."),
+    output_file: Path | None = typer.Option(
+        None, "--output-file", help="Read output text from a file."
+    ),
+    prompt: str | None = typer.Option(
+        None, "--prompt", help="Text actually given to the model (default: --source)."
+    ),
+    prompt_file: Path | None = typer.Option(
+        None, "--prompt-file", help="Read prompt text from a file."
+    ),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", "-m"),
+    top_k: int = typer.Option(10, "--top-k", "-k", min=1),
+    lens_mode: LensMode = typer.Option(LensMode.FINAL_NORM, "--lens-mode", case_sensitive=False),
+    device: str | None = typer.Option(None, "--device"),
+    dtype: str | None = typer.Option(None, "--dtype"),
+    context: int = typer.Option(
+        0, "--context", help="Extra output tokens analyzed around each diff span."
+    ),
+    no_expand: bool = typer.Option(
+        False, "--no-expand", help="Do not expand spans to whole same-class token runs."
+    ),
+    no_after_delete: bool = typer.Option(
+        False,
+        "--no-after-delete",
+        help="Do not analyze the output token right after a deletion.",
+    ),
+    verbose: bool = typer.Option(
+        False, "--verbose", help="Also print the per-layer top-k for each position."
+    ),
+    json_path: Path | None = typer.Option(
+        None, "--json", help="Write the full MultiPositionResult as JSON."
+    ),
+    html_dir: Path | None = typer.Option(
+        None, "--html-dir", help="Write one heatmap HTML per analyzed position into this directory."
+    ),
+    trust_remote_code: bool = typer.Option(False, "--trust-remote-code"),
+) -> None:
+    """Diff source text against model output and analyze only the flagged token positions."""
+    if (source is None) == (source_file is None):
+        raise typer.BadParameter("Provide exactly one of --source or --source-file.")
+    if (output is None) == (output_file is None):
+        raise typer.BadParameter("Provide exactly one of --output or --output-file.")
+    if prompt is not None and prompt_file is not None:
+        raise typer.BadParameter("Provide at most one of --prompt or --prompt-file.")
+
+    source_text = source if source is not None else source_file.read_text(encoding="utf-8")
+    output_text = output if output is not None else output_file.read_text(encoding="utf-8")
+    prompt_text = (
+        prompt
+        if prompt is not None
+        else (prompt_file.read_text(encoding="utf-8") if prompt_file is not None else None)
+    )
+
+    analyzer = _build_analyzer(model, device, dtype, lens_mode, trust_remote_code)
+    result = analyzer.analyze_diff(
+        source_text,
+        output_text,
+        prompt=prompt_text,
+        top_k=top_k,
+        context=context,
+        expand_spans=not no_expand,
+        include_after_delete=not no_after_delete,
+    )
+
+    typer.echo(
+        f"Model: {result.model_name}  "
+        f"(device={result.metadata.get('device', '?')}, lens={result.lens_mode.value})"
+    )
+    typer.echo(
+        f"Context: {len(result.input_tokens)} tokens "
+        f"(prompt {result.prompt_length}, output {len(result.output_tokens)})"
+    )
+    typer.echo("")
+
+    if not result.diff_spans:
+        typer.echo("No differences between source and output.")
+    else:
+        typer.echo(format_diff_spans(result))
+        typer.echo("")
+        typer.echo(format_position_summary(result))
+        if verbose:
+            for single in result.to_results():
+                typer.echo("")
+                typer.echo(format_layers(single))
+
+    if json_path is not None:
+        result.save_json(json_path)
+        typer.echo(f"\nSaved JSON to {json_path}")
+    if html_dir is not None and result.positions:
+        from .visualization.heatmap import export_heatmap_html
+
+        html_dir.mkdir(parents=True, exist_ok=True)
+        for single in result.to_results():
+            export_heatmap_html(single, html_dir / f"position_{single.token_index}.html")
+        typer.echo(f"Saved heatmaps to {html_dir}")
 
 
 @app.command()

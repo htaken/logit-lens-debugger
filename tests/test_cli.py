@@ -105,6 +105,46 @@ def test_compare_command(patched_cli, tmp_path):
     assert len(payload["top1_agreement"]) == 4
 
 
+def test_diff_command(patched_cli, tmp_path):
+    json_path = tmp_path / "diff.json"
+    result = runner.invoke(
+        cli.app,
+        [
+            "diff",
+            "--source",
+            "sales were 150 yen",
+            "--output",
+            "sales were 1500 yen",
+            "--top-k",
+            "3",
+            "--json",
+            str(json_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Diff spans (1):" in result.output
+    assert "[replace]" in result.output
+    assert "Position " in result.output
+    assert "settle layer" in result.output
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["prompt_length"] == 4
+    assert len(payload["positions"]) == 1
+
+
+def test_diff_command_no_differences(patched_cli):
+    result = runner.invoke(
+        cli.app,
+        ["diff", "--source", "sales were 150 yen", "--output", "sales were 150 yen"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "No differences between source and output." in result.output
+
+
+def test_diff_command_requires_source_or_source_file(patched_cli):
+    result = runner.invoke(cli.app, ["diff", "--output", "sales were 150 yen"])
+    assert result.exit_code != 0
+
+
 def test_metrics_command(sample_result, tmp_path):
     json_path = sample_result.save_json(tmp_path / "result.json")
     out_path = tmp_path / "metrics.json"

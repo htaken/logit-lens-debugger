@@ -126,6 +126,36 @@ def test_run_validates_arguments(qwen_adapter):
         engine.run(input_ids, positions=[], top_k=3)
 
 
+def test_run_per_position_target_matches_scalar_broadcast(qwen_adapter):
+    engine = LogitLensEngine(qwen_adapter)
+    input_ids = qwen_adapter.tokenize("the capital of japan is")
+    positions = [1, 3, 4]
+    scalar = engine.run(input_ids, positions=positions, top_k=3, target_token_id=6)
+    broadcast = engine.run(input_ids, positions=positions, top_k=3, target_token_id=[6, 6, 6])
+    for layers_a, layers_b in zip(scalar, broadcast, strict=True):
+        for layer_a, layer_b in zip(layers_a, layers_b, strict=True):
+            assert layer_a.target.token_id == layer_b.target.token_id
+            assert layer_a.target.rank == layer_b.target.rank
+            assert layer_a.target.probability == pytest.approx(layer_b.target.probability)
+            assert layer_a.target.logit == pytest.approx(layer_b.target.logit)
+
+
+def test_run_per_position_target_none_mixed_with_id(qwen_adapter):
+    engine = LogitLensEngine(qwen_adapter)
+    input_ids = qwen_adapter.tokenize("the capital of japan is")
+    layers = engine.run(input_ids, positions=[1, 3], top_k=3, target_token_id=[6, None])
+    first, second = layers
+    assert all(layer.target is not None and layer.target.token_id == 6 for layer in first)
+    assert all(layer.target is None for layer in second)
+
+
+def test_run_per_position_target_wrong_length_raises(qwen_adapter):
+    engine = LogitLensEngine(qwen_adapter)
+    input_ids = qwen_adapter.tokenize("the capital of japan is")
+    with pytest.raises(ValueError, match="target_token_id"):
+        engine.run(input_ids, positions=[1, 3], top_k=3, target_token_id=[6])
+
+
 def test_lens_mode_accepts_strings(qwen_adapter):
     assert LogitLensEngine(qwen_adapter, "raw").lens_mode is LensMode.RAW
     assert LogitLensEngine(qwen_adapter, "final-norm").lens_mode is LensMode.FINAL_NORM

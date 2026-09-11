@@ -12,22 +12,32 @@ from logit_lens_debugger import LogitLensAnalyzer
 from logit_lens_debugger.adapters import adapter_for_model
 from logit_lens_debugger.types import LayerResult, LensMode, LogitLensResult, TokenPrediction
 
-VOCAB = [
-    "<unk>",
-    "the",
-    "capital",
-    "of",
-    "japan",
-    "is",
-    "tokyo",
-    "osaka",
-    "kyoto",
-    "sales",
-    "were",
-    "150",
-    "1500",
-    "yen",
-] + [f"w{i}" for i in range(50)]
+VOCAB = (
+    [
+        "<unk>",
+        "the",
+        "capital",
+        "of",
+        "japan",
+        "is",
+        "tokyo",
+        "osaka",
+        "kyoto",
+        "sales",
+        "were",
+        "150",
+        "1500",
+        "yen",
+    ]
+    + [f"w{i}" for i in range(50)]
+    + [
+        "1",
+        "5",
+        "0",
+        "million",
+        "yen2",
+    ]
+)
 
 
 class ToyTokenizer:
