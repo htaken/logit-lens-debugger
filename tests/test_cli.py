@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -170,6 +171,128 @@ def test_compare_command_html(patched_cli, tmp_path):
             "--html",
             str(html_path),
         ],
+    )
+    assert result.exit_code == 0, result.output
+    assert html_path.exists()
+
+
+@pytest.fixture
+def patched_cli_two_models(monkeypatch, qwen_adapter, llama_adapter):
+    """Like ``patched_cli``, but dispatches on model name to one of two tiny models."""
+    calls: list[dict] = []
+    adapters = {"tiny-qwen": qwen_adapter, "tiny-llama": llama_adapter}
+
+    def fake_build(model, device, dtype, lens_mode, trust_remote_code):
+        calls.append(
+            {
+                "model": model,
+                "device": device,
+                "dtype": dtype,
+                "lens_mode": lens_mode,
+                "trust_remote_code": trust_remote_code,
+            }
+        )
+        return LogitLensAnalyzer(adapter=adapters[model], lens_mode=lens_mode)
+
+    monkeypatch.setattr(cli, "_build_analyzer", fake_build)
+    return calls
+
+
+def test_compare_models_command(patched_cli_two_models, tmp_path):
+    json_path = tmp_path / "cmp.json"
+    result = runner.invoke(
+        cli.app,
+        [
+            "compare-models",
+            "--model-a",
+            "tiny-qwen",
+            "--model-b",
+            "tiny-llama",
+            "--text",
+            "the capital of japan is",
+            "--json",
+            str(json_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert [c["model"] for c in patched_cli_two_models] == ["tiny-qwen", "tiny-llama"]
+    assert "A: tiny-qwen" in result.output
+    assert "B: tiny-llama" in result.output
+    assert "vocab: identical" in result.output
+    assert "A ly" in result.output and "B ly" in result.output
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["kind"] == "model"
+
+
+def test_compare_models_command_token_index_and_char_index_conflict(patched_cli_two_models):
+    result = runner.invoke(
+        cli.app,
+        [
+            "compare-models",
+            "--model-a",
+            "tiny-qwen",
+            "--model-b",
+            "tiny-llama",
+            "--text",
+            "the capital of japan is",
+            "--token-index",
+            "-1",
+            "--char-index",
+            "3",
+        ],
+    )
+    assert result.exit_code != 0
+
+
+def test_compare_models_command_concurrent(patched_cli_two_models):
+    result = runner.invoke(
+        cli.app,
+        [
+            "compare-models",
+            "--model-a",
+            "tiny-qwen",
+            "--model-b",
+            "tiny-llama",
+            "--text",
+            "the capital of japan is",
+            "--concurrent",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert [c["model"] for c in patched_cli_two_models] == ["tiny-qwen", "tiny-llama"]
+
+
+def _save_two_results(tmp_path) -> tuple[Path, Path]:
+    a_json = tmp_path / "a.json"
+    b_json = tmp_path / "b.json"
+    for model, path in (("tiny-qwen", a_json), ("tiny-llama", b_json)):
+        result = runner.invoke(
+            cli.app,
+            ["analyze", "--model", model, "--text", "the capital of japan is", "--json", str(path)],
+        )
+        assert result.exit_code == 0, result.output
+    return a_json, b_json
+
+
+def test_compare_results_command(patched_cli_two_models, tmp_path):
+    a_json, b_json = _save_two_results(tmp_path)
+    out_json = tmp_path / "cmp.json"
+    result = runner.invoke(
+        cli.app,
+        ["compare-results", str(a_json), str(b_json), "--json", str(out_json)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no distributions" in result.output
+    payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert payload["kind"] == "model"
+
+
+def test_compare_results_command_html(patched_cli_two_models, tmp_path):
+    pytest.importorskip("plotly")
+    a_json, b_json = _save_two_results(tmp_path)
+    html_path = tmp_path / "cmp.html"
+    result = runner.invoke(
+        cli.app, ["compare-results", str(a_json), str(b_json), "--html", str(html_path)]
     )
     assert result.exit_code == 0, result.output
     assert html_path.exists()

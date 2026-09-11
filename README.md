@@ -286,6 +286,72 @@ cmp.first_layer_target_rank_differs()           # 共通 target の rank が最�
 
 `keep_log_probs=True`（既定）は 1 position あたり `(層数+1) × vocab_size` の float32 を CPU に保持します。Qwen2.5-0.5B（25 層、vocab 151936）なら約 15 MB で、`compare()` が返る前に解放されるので実害はありません。KL/JS が不要なら `keep_log_probs=False` を渡すと、その分の計算とメモリ確保自体を省けます（`lc.kl_a_b` などは `None` になります）。
 
+#### モデル間比較（Model comparison）
+
+同じ入力テキストを **2 つの異なるモデル**（例: `Qwen2.5-0.5B` vs `Qwen2.5-1.5B`、Qwen vs Llama）に通し、`analyzer.compare()` と同じ `ComparisonResult`（`kind="model"`）で layer ごとに並べます。
+
+```python
+from logit_lens_debugger import compare_model_names
+
+cmp = compare_model_names(
+    "Qwen/Qwen2.5-0.5B", "Qwen/Qwen2.5-1.5B",
+    text="Q: What is the capital of Japan?\nA:",
+    token_index=-1,         # または char_index=... （下記）
+    top_k=10,
+    target_token=None,      # str のみ許可。int の token id はモデルごとに語彙が違うため TypeError
+    keep_log_probs=True,    # 語彙が同一の場合のみ KL/JS に使われる
+    sequential=True,        # 既定: A を解析・解放してから B をロードする
+)
+```
+
+`sequential=True`（既定）は A をロード → 解析 → `del` + `gc.collect()`（CUDA/MPS ならキャッシュも解放）→ B をロード、の順で進みます。M2 16GB のような環境で 1.5B クラスのモデルを 2 つ同時にロードするのは厳しいため、既定では 2 つのモデルが同時にメモリへ載ることはありません。同一語彙判定（後述）はこのとき互いのモデルを見ずに、それぞれの `vocab_fingerprint()` だけで行います。両方のモデルを同時にロードしたい場合（例: 実験的に速度を優先する、または同じ tokenizer インスタンスを共有させて `vocab_identical` の高速パスを使わせたい場合）は `sequential=False` を渡します。既にロード済みの 2 つの `LogitLensAnalyzer` を比較したいだけなら `compare_models(analyzer_a, analyzer_b, text, ...)` を直接使えます（`compare_model_names` はモデル名からのロードを足しただけの薄いラッパです）。
+
+2 つのモデルを比べるときに生じる 3 つの不一致は、次のように吸収します。
+
+| 不一致 | 対応 |
+|---|---|
+| 層数が違う | 相対深さ（`layer / num_layers`）で最も近い層同士を対応付ける（`align_layers()`、補間はしない） |
+| 語彙が違う | `token_id` ではなく **decode した文字列** で `top1_same` / `topk_overlap` を比較する。KL/JS は語彙が完全に一致するときだけ計算し、それ以外は `None` |
+| tokenization が違い position がずれる | 既定の末尾（`token_index=-1`）なら通常は両者で揃う。文中の特定位置を見たい場合は **`char_index`**（文字オフセット）を指定すると、各モデルの tokenizer が「その文字を含む token」に変換する（fast tokenizer なら `offset_mapping` で厳密、低速 tokenizer は累積デコード長からの近似） |
+
+```python
+cmp.kind                      # "model"
+cmp.alignment                  # [(layer_a, layer_b), ...]  層数が違えば恒等対応にならない
+cmp.metadata["same_vocab"]     # True なら KL/JS が使え、token_id で比較されている
+cmp.metadata["model_a"], cmp.metadata["model_b"]
+cmp.metadata["char_index"]     # 指定した場合のみ非 None
+```
+
+語彙が同一かどうかは `vocab_identical(adapter_a, adapter_b)` で判定します（同じ `tokenizer` オブジェクトを共有しているか、そうでなければ `adapter.vocab_fingerprint()`— 語彙全体の sha256 — が一致するか）。
+
+CLI からも同じことができます。
+
+```bash
+uv run logit-lens compare-models \
+  --model-a Qwen/Qwen2.5-0.5B --model-b Qwen/Qwen2.5-1.5B \
+  --text $'Q: What is the capital of Japan?\nA:' \
+  --json outputs/model_cmp.json --html outputs/model_cmp.html
+```
+
+```
+A: Qwen/Qwen2.5-0.5B  (24 layers, token_index=10, analyzed ':')
+B: Qwen/Qwen2.5-1.5B  (28 layers, token_index=10, analyzed ':')
+vocab: identical (KL/JS available)
+
+ A ly  B ly  A top-1 (p)                B top-1 (p)                same  overlap   KL(A‖B)   KL(B‖A)       JS  target rank A->B
+    0     0  ' __'                (0.010)  ' __'                (0.010)  yes     1.000    0.0000    0.0000   0.0000  -
+   12    14  ' Tokyo'              (0.340)  ' Tokyo'              (0.560)  yes     0.700    0.4100    0.3800   0.1900  -
+   24    28  ' Tokyo'              (0.720)  ' Tokyo'              (0.910)  yes     0.900    0.0900    0.1100   0.0500  -
+```
+
+`--token-index` と `--char-index` は排他です。モデルの読み込みを両方同時に行いたい場合は `--concurrent` を付けます（既定は逐次ロード）。語彙が異なるモデル同士（Qwen vs Llama など）を比べると `vocab: different (compared by decoded text; KL/JS n/a)` と表示され、KL/JS 列は `-` になります。
+
+モデルをロードせず、`analyze --json` で保存済みの 2 つの結果だけを比べることもできます（KL/JS は保存されていないため常に利用不可）。
+
+```bash
+uv run logit-lens compare-results outputs/qwen_0.5b.json outputs/qwen_1.5b.json --json outputs/model_cmp.json
+```
+
 #### Layer instability（予測の不安定さ）
 
 `result.trajectory()` の top-1 が layer をまたいでどれだけ入れ替わるかを 1 つのスコアにまとめます。モデル・tokenizer は不要で、`LogitLensResult`（JSON から復元したものでも可）だけから計算できる純関数です。
@@ -563,16 +629,17 @@ Hugging Face Transformers
 | `src/logit_lens_debugger/adapters/qwen.py`, `llama.py` | ファミリー別 adapter（`supported_model_types` を宣言） |
 | `src/logit_lens_debugger/adapters/registry.py` | `config.model_type` → adapter の解決、`load_adapter` / `register_adapter` |
 | `src/logit_lens_debugger/engine.py` | Logit Lens 本体（position ごとに別 target も指定可能） |
-| `src/logit_lens_debugger/analyzer.py` | 高レベル API（`analyze_positions` / `analyze_generation` / `analyze_diff` を含む） |
+| `src/logit_lens_debugger/analyzer.py` | 高レベル API（`analyze_positions` / `analyze_generation` / `analyze_diff` / `compare_models()` / `compare_model_names()` を含む） |
 | `src/logit_lens_debugger/metrics.py` | `compute_instability()` → `InstabilityMetrics`（torch 非依存、JSON からも計算可） |
 | `src/logit_lens_debugger/diff.py` | `diff_token_sequences()` / `select_positions()` / `token_class()`（torch 非依存、diff から対象 position を選ぶ） |
 | `src/logit_lens_debugger/anomaly.py` | `score_position()` / `detect_anomalies()` → `AnomalyReport`（torch 非依存、diff / instability を合成して token をスコアリング） |
-| `src/logit_lens_debugger/comparison.py` | `compare_results()` / `compare_layer()` / KL・JS divergence / `topk_overlap()`（`analyzer.compare()` の実体。KL/JS のみ torch 使用） |
+| `src/logit_lens_debugger/comparison.py` | `compare_results()` / `compare_layer()` / KL・JS divergence / `topk_overlap()` / `align_layers()` / `vocab_identical()`（`analyzer.compare()` / `compare_models()` の実体。KL/JS のみ torch 使用） |
 | `src/logit_lens_debugger/visualization/` | ヒートマップ・trajectory・comparison（Plotly）とテキスト整形 |
-| `src/logit_lens_debugger/visualization/comparison.py` | `format_comparison()`（テキスト表）と `build_comparison_figure()` / `export_comparison_html()`（layer ごとの KL/JS 折れ線） |
-| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `diff` / `scan` / `metrics` / `visualize`） |
+| `src/logit_lens_debugger/visualization/comparison.py` | `format_comparison()`（テキスト表）と `format_model_comparison_header()`、`build_comparison_figure()` / `export_comparison_html()`（layer ごとの KL/JS 折れ線） |
+| `src/logit_lens_debugger/cli.py` | typer CLI（`analyze` / `compare` / `compare-models` / `compare-results` / `diff` / `scan` / `metrics` / `visualize`） |
 | `tests/` | 極小ランダム初期化モデルによるオフラインテスト + opt-in の実モデル統合テスト |
 | `examples/basic_analysis.py` | API の最小サンプル |
+| `examples/compare_models.py` | 2 モデル比較（`compare_model_names`、逐次ロード）のサンプル |
 
 ## 対応モデル
 
@@ -624,6 +691,8 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 - diff（`analyze_diff` / `logit-lens diff`）は tokenizer の token 列ベースの比較です。出力が原文の大幅な言い換え・順序入替の場合は span がほぼ全域になり、絞り込みの効果が薄れます。文字オフセットベースの diff は未実装です。
 - Llama は実 checkpoint での検証を行っていません。MoE や非標準レイアウト（`model.model.norm` / `lm_head` 以外に norm や head があるモデル）は未対応です。
 - 可視化は HTML export のみで、ライトテーマ固定です。
+- モデル間比較（`compare_models` / `compare_model_names`）の層対応付け（`align_layers`）は相対深さに基づく最近傍のヒューリスティックで、補間は行いません。KL/JS は語彙が完全に一致するモデル同士でしか計算できません（`vocab_identical` が False なら常に `None`）。
+- `char_to_token`（`char_index` による position 指定）は fast tokenizer なら `offset_mapping` で厳密ですが、低速 tokenizer や `ToyTokenizer` では累積デコード長からの近似になります。
 
 ## 次に実装すると良い機能
 
@@ -633,7 +702,7 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 2. ~~自動 anomaly detection~~ → 実装済み（`anomaly.py`、`analyzer.detect_anomalies()`、CLI `scan` コマンド）
 3. ~~Layer instability スコア~~ → 実装済み（`metrics.py`）
 4. ~~Prompt comparison の拡張~~ → 実装済み（`comparison.py`、`analyzer.compare()` に `token_index_b` / KL・JS / top-k overlap / target rank 差、CLI `compare` の拡張オプション）
-5. **Model comparison**（9.5）: 2 つの `LogitLensAnalyzer` の結果を同じ `ComparisonResult` 形式で並べる。
+5. ~~Model comparison~~ → 実装済み（`analyzer.compare_models()` / `compare_model_names()`、`comparison.align_layers()` / `vocab_identical()`、CLI `compare-models` / `compare-results` コマンド）
 6. **chat template オプション**、**tuned lens**、**batch 対応**。
 
 ## 参考

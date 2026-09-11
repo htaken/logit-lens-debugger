@@ -115,6 +115,29 @@ def test_decode_multiple_tokens(qwen_adapter):
     assert qwen_adapter.decode([1, 2]) == "the capital"
 
 
+def test_char_to_token(qwen_adapter):
+    text = "the capital of japan is"
+    assert qwen_adapter.char_to_token(text, 0) == 0
+    assert qwen_adapter.char_to_token(text, 4) == 1
+    assert qwen_adapter.char_to_token(text, 3) == 1  # the space right after "the"
+    assert qwen_adapter.char_to_token(text, -1) == 4
+    with pytest.raises(IndexError):
+        qwen_adapter.char_to_token(text, len(text))
+    with pytest.raises(IndexError):
+        qwen_adapter.char_to_token(text, -(len(text) + 1))
+
+
+def test_vocab_fingerprint(qwen_adapter, llama_adapter, llama_adapter_other_vocab):
+    fingerprint = qwen_adapter.vocab_fingerprint()
+    assert isinstance(fingerprint, str)
+    assert len(fingerprint) == 64
+    assert all(c in "0123456789abcdef" for c in fingerprint)
+    # Same (shared) tokenizer -> same fingerprint.
+    assert llama_adapter.vocab_fingerprint() == fingerprint
+    # Different vocabulary -> different fingerprint.
+    assert llama_adapter_other_vocab.vocab_fingerprint() != fingerprint
+
+
 def test_resolve_device_and_dtype():
     assert resolve_device("cpu") == torch.device("cpu")
     assert resolve_device(None).type in {"cpu", "cuda", "mps"}

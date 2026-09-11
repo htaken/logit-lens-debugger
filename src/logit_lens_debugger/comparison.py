@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from .adapters.base import ModelAdapter
 from .types import ComparisonResult, LayerComparison, LayerResult, LogitLensResult
 
 
@@ -174,4 +175,43 @@ def compare_results(
         alignment=alignment,
         kind=kind,
         metadata=dict(metadata or {}),
+    )
+
+
+def align_layers(num_layers_a: int, num_layers_b: int) -> list[tuple[int, int]]:
+    """Nearest relative-depth alignment between two models' decoder-block counts.
+
+    One entry per ``layer_a`` in ``0..num_layers_a`` (inclusive; ``num_layers`` counts
+    decoder blocks, layer 0 is the embedding output), with
+    ``layer_b = round(layer_a * num_layers_b / num_layers_a)``. Endpoints always map to
+    endpoints and the mapping is monotone non-decreasing; no interpolation is done, only
+    a nearest-neighbour lookup by relative depth. ``num_layers_a == 0`` returns
+    ``[(0, 0)]`` (nothing to divide by).
+    """
+    if num_layers_a == 0:
+        return [(0, 0)]
+    return [
+        (layer_a, round(layer_a * num_layers_b / num_layers_a))
+        for layer_a in range(num_layers_a + 1)
+    ]
+
+
+def vocab_identical(adapter_a: ModelAdapter, adapter_b: ModelAdapter) -> bool:
+    """Whether two adapters expose the same id -> token vocabulary.
+
+    Fast path: both expose a ``tokenizer`` attribute and it is the very same object
+    (e.g. two adapters built from the same loaded tokenizer). Otherwise both
+    :meth:`~.adapters.base.ModelAdapter.vocab_fingerprint` must be non-``None`` and
+    equal -- a cheap, comparison-agnostic way to decide this without needing both
+    adapters alive at the same time (see :func:`~.analyzer.compare_model_names`'s
+    ``sequential=True``).
+    """
+    tokenizer_a = getattr(adapter_a, "tokenizer", None)
+    tokenizer_b = getattr(adapter_b, "tokenizer", None)
+    if tokenizer_a is not None and tokenizer_b is not None and tokenizer_a is tokenizer_b:
+        return True
+    fingerprint_a = adapter_a.vocab_fingerprint()
+    fingerprint_b = adapter_b.vocab_fingerprint()
+    return (
+        fingerprint_a is not None and fingerprint_b is not None and fingerprint_a == fingerprint_b
     )

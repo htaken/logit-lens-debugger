@@ -69,6 +69,9 @@ class ToyTokenizer:
     def convert_ids_to_tokens(self, ids) -> list[str]:
         return [self.vocab[int(i)] for i in ids]
 
+    def get_vocab(self) -> dict[str, int]:
+        return dict(self.index)
+
 
 @pytest.fixture(scope="session")
 def toy_tokenizer() -> ToyTokenizer:
@@ -132,6 +135,18 @@ def qwen_adapter(tiny_qwen_model, toy_tokenizer):
 @pytest.fixture
 def llama_adapter(tiny_llama_model, toy_tokenizer):
     return adapter_for_model(tiny_llama_model, toy_tokenizer, model_name="tiny-llama")
+
+
+@pytest.fixture
+def llama_adapter_other_vocab(tiny_llama_model):
+    """Same tiny Llama model, but wrapped with a distinct (reversed) vocabulary.
+
+    Same vocab *size* (so the model, sized for ``len(VOCAB)``, still runs) but a
+    different id -> token mapping, for testing the "vocabularies differ" path of
+    model comparison (``vocab_identical`` is False, ``vocab_fingerprint()`` differs).
+    """
+    other_tokenizer = ToyTokenizer(VOCAB[::-1])
+    return adapter_for_model(tiny_llama_model, other_tokenizer, model_name="tiny-llama-other-vocab")
 
 
 @pytest.fixture

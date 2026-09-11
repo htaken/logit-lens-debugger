@@ -1,10 +1,11 @@
-"""High-level API: ``LogitLensAnalyzer.analyze()`` and ``.compare()``."""
+"""High-level API: ``LogitLensAnalyzer.analyze()`` / ``.compare()`` and model comparison."""
 
 from __future__ import annotations
 
+import gc
 import warnings
-from collections.abc import Sequence
-from dataclasses import replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -12,7 +13,7 @@ import torch
 from .adapters.base import ModelAdapter
 from .adapters.registry import load_adapter
 from .anomaly import detect_anomalies as _score_anomalies
-from .comparison import compare_results
+from .comparison import align_layers, compare_results, vocab_identical
 from .diff import diff_token_sequences, select_positions
 from .engine import LogitLensEngine
 from .types import (
@@ -481,3 +482,226 @@ class LogitLensAnalyzer:
             kind="prompt",
             metadata={"device": str(self.adapter.device), "keep_log_probs": keep_log_probs},
         )
+
+
+# ---------------------------------------------------------------------- model comparison
+
+
+@dataclass
+class ModelSide:
+    """One analyzed side of a model-vs-model comparison, produced by :func:`_model_side`.
+
+    ``log_probs`` is ``[num_layers + 1, V]`` (already sliced to the single compared
+    position) when ``keep_log_probs`` was requested, else ``None``. ``vocab_fingerprint``
+    lets :func:`compare_model_names` decide ``same_vocab`` from the two sides alone, once
+    the adapter that produced it may already have been released (``sequential=True``).
+    """
+
+    result: LogitLensResult
+    log_probs: torch.Tensor | None
+    vocab_fingerprint: str | None
+    model_name: str
+
+
+def _model_side(
+    analyzer: LogitLensAnalyzer,
+    text: str,
+    token_index: int,
+    char_index: int | None,
+    top_k: int,
+    target_token: str | None,
+    keep_log_probs: bool,
+) -> ModelSide:
+    """Analyze one side of a model comparison.
+
+    ``char_index``, when given, overrides ``token_index`` via
+    ``analyzer.adapter.char_to_token`` so the two models can be probed at "the same
+    place in the text" even when their tokenizers segment it differently.
+    ``target_token`` must be a ``str`` or ``None`` -- unlike :meth:`LogitLensAnalyzer.analyze`,
+    an int token id would be specific to one model's vocabulary and cannot be resolved
+    in the other's, so it is rejected outright rather than silently misinterpreted.
+    """
+    if target_token is not None and not isinstance(target_token, str):
+        raise TypeError(
+            f"target_token must be a str or None for model comparison, got "
+            f"{type(target_token).__name__} (int token ids are vocabulary-specific and "
+            "cannot be shared across models)"
+        )
+    if char_index is not None:
+        token_index = analyzer.adapter.char_to_token(text, char_index)
+
+    result, log_probs = analyzer._analyze_detailed(
+        text,
+        token_index=token_index,
+        top_k=top_k,
+        target_token=target_token,
+        keep_log_probs=keep_log_probs,
+    )
+    if log_probs is not None:
+        log_probs = log_probs[:, 0, :]
+    return ModelSide(
+        result=result,
+        log_probs=log_probs,
+        vocab_fingerprint=analyzer.adapter.vocab_fingerprint(),
+        model_name=analyzer.model_name,
+    )
+
+
+def _combine_model_sides(
+    side_a: ModelSide,
+    side_b: ModelSide,
+    same_vocab: bool,
+    keep_log_probs: bool,
+    extra_metadata: dict[str, Any] | None = None,
+) -> ComparisonResult:
+    """Build the ``kind="model"`` :class:`ComparisonResult` from two analyzed sides.
+
+    Layers are aligned by relative depth (:func:`~.comparison.align_layers`); comparison
+    is by decoded token text unless the two models share a vocabulary, in which case
+    token ids (and, if kept, full-vocabulary log-probabilities for KL/JS) are used too.
+    """
+    alignment = align_layers(side_a.result.num_layers, side_b.result.num_layers)
+    compare_by = "token_id" if same_vocab else "text"
+    log_probs_a = side_a.log_probs if same_vocab else None
+    log_probs_b = side_b.log_probs if same_vocab else None
+
+    metadata = {
+        "model_a": side_a.model_name,
+        "model_b": side_b.model_name,
+        "same_vocab": same_vocab,
+        "token_index_a": side_a.result.token_index,
+        "token_index_b": side_b.result.token_index,
+        "char_index": None,
+        "keep_log_probs": keep_log_probs,
+        **(extra_metadata or {}),
+    }
+    return compare_results(
+        side_a.result,
+        side_b.result,
+        log_probs_a=log_probs_a,
+        log_probs_b=log_probs_b,
+        alignment=alignment,
+        compare_by=compare_by,
+        kind="model",
+        metadata=metadata,
+    )
+
+
+def compare_models(
+    analyzer_a: LogitLensAnalyzer,
+    analyzer_b: LogitLensAnalyzer,
+    text: str,
+    token_index: int = -1,
+    char_index: int | None = None,
+    top_k: int = 10,
+    target_token: str | None = None,
+    keep_log_probs: bool = True,
+) -> ComparisonResult:
+    """Compare the same text through two already-loaded models, layer-wise.
+
+    Absorbs the three ways two models can mismatch (see the module docs / README):
+    different layer counts (aligned by relative depth), different vocabularies (falls
+    back to comparing decoded token text; KL/JS need identical vocabularies, checked via
+    :func:`~.comparison.vocab_identical`) and different tokenization of the same text
+    (``token_index=-1``, the default, keeps both at "the last token"; use ``char_index``
+    to align by character offset instead). Both analyzers stay loaded for the whole
+    call -- use :func:`compare_model_names` for the memory-constrained, load-one-at-a-time
+    path.
+    """
+    side_a = _model_side(
+        analyzer_a, text, token_index, char_index, top_k, target_token, keep_log_probs
+    )
+    side_b = _model_side(
+        analyzer_b, text, token_index, char_index, top_k, target_token, keep_log_probs
+    )
+    same_vocab = vocab_identical(analyzer_a.adapter, analyzer_b.adapter)
+    return _combine_model_sides(
+        side_a, side_b, same_vocab, keep_log_probs, extra_metadata={"char_index": char_index}
+    )
+
+
+def compare_model_names(
+    model_a: str,
+    model_b: str,
+    text: str,
+    *,
+    token_index: int = -1,
+    char_index: int | None = None,
+    top_k: int = 10,
+    target_token: str | None = None,
+    keep_log_probs: bool = True,
+    sequential: bool = True,
+    factory: Callable[[str], LogitLensAnalyzer] | None = None,
+    device: str | torch.device | None = None,
+    dtype: str | torch.dtype | None = None,
+    lens_mode: LensMode | str = LensMode.FINAL_NORM,
+    **model_kwargs: Any,
+) -> ComparisonResult:
+    """Load two models by name and compare them, as :func:`compare_models`.
+
+    ``factory`` builds a :class:`LogitLensAnalyzer` from a model name (default:
+    ``LogitLensAnalyzer(name, device=device, dtype=dtype, lens_mode=lens_mode,
+    **model_kwargs)``); override it to control loading (e.g. a custom adapter,
+    quantization kwargs, or -- in tests -- an in-memory tiny model per name).
+
+    ``sequential=True`` (the default) builds and analyzes model A, records its result
+    and vocabulary fingerprint, then releases it (``del`` plus ``gc.collect()`` and the
+    accelerator's cache) *before* building model B -- on a memory-constrained machine
+    (e.g. an M2 16 GB Mac) two mid-size models may not fit at once. ``same_vocab`` is
+    then decided from the two fingerprints alone (both non-``None`` and equal), since
+    the two adapters are never alive together. ``sequential=False`` keeps both models
+    loaded and delegates to :func:`compare_models` (needed if ``vocab_identical``'s
+    same-tokenizer-object fast path should apply, e.g. two checkpoints sharing one
+    loaded tokenizer via a custom ``factory``).
+    """
+    if factory is None:
+
+        def factory(name: str) -> LogitLensAnalyzer:
+            return LogitLensAnalyzer(
+                name, device=device, dtype=dtype, lens_mode=lens_mode, **model_kwargs
+            )
+
+    if not sequential:
+        analyzer_a = factory(model_a)
+        analyzer_b = factory(model_b)
+        return compare_models(
+            analyzer_a,
+            analyzer_b,
+            text,
+            token_index=token_index,
+            char_index=char_index,
+            top_k=top_k,
+            target_token=target_token,
+            keep_log_probs=keep_log_probs,
+        )
+
+    analyzer_a = factory(model_a)
+    side_a = _model_side(
+        analyzer_a, text, token_index, char_index, top_k, target_token, keep_log_probs
+    )
+    del analyzer_a
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    mps_backend = getattr(torch.backends, "mps", None)
+    if (
+        mps_backend is not None
+        and mps_backend.is_available()
+        and hasattr(torch, "mps")
+        and hasattr(torch.mps, "empty_cache")
+    ):
+        torch.mps.empty_cache()
+
+    analyzer_b = factory(model_b)
+    side_b = _model_side(
+        analyzer_b, text, token_index, char_index, top_k, target_token, keep_log_probs
+    )
+
+    same_vocab = (
+        side_a.vocab_fingerprint is not None
+        and side_b.vocab_fingerprint is not None
+        and side_a.vocab_fingerprint == side_b.vocab_fingerprint
+    )
+    return _combine_model_sides(
+        side_a, side_b, same_vocab, keep_log_probs, extra_metadata={"char_index": char_index}
+    )

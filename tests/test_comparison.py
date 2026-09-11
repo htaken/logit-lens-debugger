@@ -8,11 +8,13 @@ import torch
 
 from logit_lens_debugger import ComparisonResult, LayerComparison, LogitLensAnalyzer
 from logit_lens_debugger.comparison import (
+    align_layers,
     compare_layer,
     compare_results,
     js_divergence,
     kl_divergence,
     topk_overlap,
+    vocab_identical,
 )
 from logit_lens_debugger.types import LayerResult, TokenPrediction
 
@@ -351,3 +353,48 @@ def test_comparison_result_from_dict_legacy(sample_result):
     assert restored.alignment == []
     assert restored.kind == "prompt"
     assert restored.metadata == {}
+
+
+# --------------------------------------------------------------------------- align_layers
+
+
+def test_align_layers_more_a_than_b():
+    assert align_layers(3, 2) == [(0, 0), (1, 1), (2, 1), (3, 2)]
+
+
+def test_align_layers_more_b_than_a():
+    aligned = align_layers(2, 3)
+    assert aligned[0] == (0, 0)
+    assert aligned[-1] == (2, 3)
+    layer_bs = [b for _, b in aligned]
+    assert layer_bs == sorted(layer_bs)  # monotone non-decreasing
+
+
+def test_align_layers_equal_counts_is_identity():
+    assert align_layers(4, 4) == [(i, i) for i in range(5)]
+
+
+def test_align_layers_zero_a():
+    assert align_layers(0, 5) == [(0, 0)]
+
+
+@pytest.mark.parametrize(("num_a", "num_b"), [(1, 1), (3, 7), (7, 3), (5, 1), (1, 5), (10, 10)])
+def test_align_layers_endpoints_and_monotone(num_a, num_b):
+    aligned = align_layers(num_a, num_b)
+    assert len(aligned) == num_a + 1
+    assert aligned[0] == (0, 0)
+    assert aligned[-1] == (num_a, num_b)
+    assert [a for a, _ in aligned] == list(range(num_a + 1))
+    layer_bs = [b for _, b in aligned]
+    assert layer_bs == sorted(layer_bs)
+
+
+# ------------------------------------------------------------------------ vocab_identical
+
+
+def test_vocab_identical_same_tokenizer_object(qwen_adapter, llama_adapter):
+    assert vocab_identical(qwen_adapter, llama_adapter) is True
+
+
+def test_vocab_identical_false_for_different_vocab(qwen_adapter, llama_adapter_other_vocab):
+    assert vocab_identical(qwen_adapter, llama_adapter_other_vocab) is False

@@ -7,6 +7,8 @@ The engine, analyzer and visualization code talk to ``ModelAdapter`` only.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any
@@ -112,6 +114,37 @@ class ModelAdapter(ABC):
         e.g. by not inserting spaces between sub-word pieces).
         """
         return "".join(self.decode_token(i) for i in token_ids)
+
+    def char_to_token(self, text: str, char_index: int) -> int:
+        """Index of the token whose decoded span contains character ``char_index``.
+
+        Negative ``char_index`` counts from the end of ``text``; out of range raises
+        ``IndexError``. Default implementation has no offset mapping to rely on, so it
+        decodes increasingly long token prefixes and returns the first whose cumulative
+        decoded length exceeds ``char_index`` (falling back to the last token if none
+        does) -- an approximation that works for any tokenizer, fast or not. Subclasses
+        with fast tokenizers should override with an exact offset-mapping lookup.
+        """
+        if char_index < 0:
+            char_index += len(text)
+        if not 0 <= char_index < len(text):
+            raise IndexError(f"char_index {char_index} out of range for text of length {len(text)}")
+        ids = self.tokenize(text)[0].tolist()
+        for i in range(len(ids)):
+            end = len(self.decode(ids[: i + 1]))
+            if char_index < end:
+                return i
+        return len(ids) - 1
+
+    def vocab_fingerprint(self) -> str | None:
+        """Stable identifier of the id -> token vocabulary mapping, when available.
+
+        ``None`` by default (no generic way to enumerate every adapter's vocabulary);
+        used by :func:`~.comparison.vocab_identical` to decide whether two models share
+        a vocabulary without keeping both alive at once. See
+        :meth:`HFCausalLMAdapter.vocab_fingerprint` for the concrete implementation.
+        """
+        return None
 
 
 class HFCausalLMAdapter(ModelAdapter):
@@ -261,3 +294,32 @@ class HFCausalLMAdapter(ModelAdapter):
 
     def decode(self, token_ids: Sequence[int]) -> str:
         return self.tokenizer.decode(list(token_ids))
+
+    def char_to_token(self, text: str, char_index: int) -> int:
+        if char_index < 0:
+            char_index += len(text)
+        if not 0 <= char_index < len(text):
+            raise IndexError(f"char_index {char_index} out of range for text of length {len(text)}")
+
+        if getattr(self.tokenizer, "is_fast", False):
+            offsets = self.tokenizer(text, return_offsets_mapping=True)["offset_mapping"]
+            last_non_special = None
+            for i, (start, end) in enumerate(offsets):
+                if start == end:  # special token, no text span
+                    continue
+                last_non_special = i
+                if start <= char_index < end:
+                    return i
+            return last_non_special
+
+        ids = self.tokenize(text)[0].tolist()
+        for i in range(len(ids)):
+            end = len(self.tokenizer.decode(ids[: i + 1], skip_special_tokens=True))
+            if char_index < end:
+                return i
+        return len(ids) - 1
+
+    def vocab_fingerprint(self) -> str | None:
+        vocab = self.tokenizer.get_vocab()
+        payload = json.dumps(sorted(vocab.items(), key=lambda kv: kv[1]), ensure_ascii=False)
+        return hashlib.sha256(payload.encode()).hexdigest()

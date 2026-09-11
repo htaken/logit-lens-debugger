@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from logit_lens_debugger import LogitLensAnalyzer, compare_models
 from logit_lens_debugger.visualization import (
     build_comparison_figure,
     build_heatmap_figure,
@@ -11,6 +12,7 @@ from logit_lens_debugger.visualization import (
     export_trajectory_html,
     format_comparison,
     format_layers,
+    format_model_comparison_header,
     format_trajectory,
 )
 from logit_lens_debugger.visualization._theme import display_token
@@ -120,3 +122,33 @@ def test_export_comparison_html(analyzer, tmp_path):
     content = path.read_text(encoding="utf-8")
     assert "<html" in content.lower()
     assert "plotly" in content
+
+
+def _model_comparison(qwen_adapter, llama_adapter):
+    qwen_analyzer = LogitLensAnalyzer(adapter=qwen_adapter)
+    llama_analyzer = LogitLensAnalyzer(adapter=llama_adapter)
+    return compare_models(qwen_analyzer, llama_analyzer, "the capital of japan is")
+
+
+def test_format_comparison_model_kind_two_layer_columns(qwen_adapter, llama_adapter):
+    cmp = _model_comparison(qwen_adapter, llama_adapter)
+    text = format_comparison(cmp)
+    assert "A ly" in text and "B ly" in text
+    assert "layer " not in text.splitlines()[0]
+
+
+def test_format_model_comparison_header(qwen_adapter, llama_adapter):
+    cmp = _model_comparison(qwen_adapter, llama_adapter)
+    header = format_model_comparison_header(cmp)
+    assert "A: tiny-qwen" in header
+    assert "B: tiny-llama" in header
+    assert "vocab: identical" in header
+
+
+def test_comparison_figure_model_kind_title(qwen_adapter, llama_adapter):
+    pytest.importorskip("plotly")
+    cmp = _model_comparison(qwen_adapter, llama_adapter)
+    fig = build_comparison_figure(cmp)
+    assert "Model comparison" in fig.layout.title.text
+    assert "tiny-qwen" in fig.layout.title.text
+    assert "tiny-llama" in fig.layout.title.text

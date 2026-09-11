@@ -1,4 +1,9 @@
-from .comparison import build_comparison_figure, export_comparison_html, format_comparison
+from .comparison import (
+    build_comparison_figure,
+    export_comparison_html,
+    format_comparison,
+    format_model_comparison_header,
+)
 from .heatmap import build_heatmap_figure, export_heatmap_html
 from .trajectory import (
     build_trajectory_figure,
@@ -23,6 +28,7 @@ __all__ = [
     "format_diff_spans",
     "format_instability",
     "format_layers",
+    "format_model_comparison_header",
     "format_position_summary",
     "format_trajectory",
 ]

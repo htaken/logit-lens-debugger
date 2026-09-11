@@ -7,9 +7,10 @@ from pathlib import Path
 
 import typer
 
-from .analyzer import LogitLensAnalyzer
+from .analyzer import LogitLensAnalyzer, compare_model_names
+from .comparison import align_layers, compare_results
 from .types import AnomalyReport, ComparisonResult, LensMode, LogitLensResult
-from .visualization.comparison import format_comparison
+from .visualization.comparison import format_comparison, format_model_comparison_header
 from .visualization.trajectory import (
     format_anomaly_report,
     format_diff_spans,
@@ -202,6 +203,172 @@ def compare(
     typer.echo(f"Model: {a.model_name}  (lens={a.lens_mode.value})")
     typer.echo(f"A: {text_a!r}  -> analyzed {_display(a.analyzed_token)} at index {a.token_index}")
     typer.echo(f"B: {text_b!r}  -> analyzed {_display(b.analyzed_token)} at index {b.token_index}")
+    typer.echo("")
+    typer.echo(format_comparison(comparison, kl_threshold=kl_threshold))
+
+    if json_path is not None:
+        comparison.save_json(json_path)
+        typer.echo(f"Saved JSON to {json_path}")
+    if html_path is not None:
+        from .visualization.comparison import export_comparison_html
+
+        export_comparison_html(comparison, html_path)
+        typer.echo(f"Saved comparison chart to {html_path}")
+
+
+@app.command("compare-models")
+def compare_models_cmd(
+    model_a: str = typer.Option(..., "--model-a", help="First model's hub id or local path."),
+    model_b: str = typer.Option(..., "--model-b", help="Second model's hub id or local path."),
+    text: str = typer.Option(..., "--text", "-t", help="Input text analyzed by both models."),
+    token_index: int | None = typer.Option(
+        None,
+        "--token-index",
+        "-i",
+        help=(
+            "Position for both models; negative counts from the end (default: -1). "
+            "Mutually exclusive with --char-index."
+        ),
+    ),
+    char_index: int | None = typer.Option(
+        None,
+        "--char-index",
+        help=(
+            "Character offset into --text; each model's own tokenizer resolves the token "
+            "containing it, for when the two tokenizers segment --text differently. "
+            "Mutually exclusive with --token-index."
+        ),
+    ),
+    target_token: str | None = typer.Option(
+        None,
+        "--target-token",
+        help="Track this token's rank/probability in both models (default: each model's own next).",
+    ),
+    top_k: int = typer.Option(10, "--top-k", "-k", min=1),
+    lens_mode: LensMode = typer.Option(LensMode.FINAL_NORM, "--lens-mode", case_sensitive=False),
+    device: str | None = typer.Option(None, "--device"),
+    dtype: str | None = typer.Option(None, "--dtype"),
+    kl: bool = typer.Option(
+        True,
+        "--kl/--no-kl",
+        help="Keep full-vocab log-probs for KL/JS (only usable when both vocabularies match).",
+    ),
+    kl_threshold: float = typer.Option(
+        0.1, "--kl-threshold", help="JS divergence threshold reported in the footer line."
+    ),
+    concurrent: bool = typer.Option(
+        False,
+        "--concurrent",
+        help=(
+            "Load both models at once instead of releasing model A before loading model B "
+            "(uses more memory; the default is sequential loading)."
+        ),
+    ),
+    json_path: Path | None = typer.Option(
+        None, "--json", help="Write the full ComparisonResult as JSON."
+    ),
+    html_path: Path | None = typer.Option(
+        None, "--html", help="Write a KL/JS-by-layer chart (plotly)."
+    ),
+    trust_remote_code: bool = typer.Option(False, "--trust-remote-code"),
+) -> None:
+    """Compare the same text through two different models, layer-wise.
+
+    Absorbs mismatched layer counts (aligned by relative depth), mismatched
+    vocabularies (falls back to comparing decoded token text; KL/JS need identical
+    vocabularies) and mismatched tokenization (use --char-index to align by character
+    offset instead of --token-index). By default, model A is released before model B
+    is loaded (--concurrent keeps both loaded, using more memory).
+    """
+    if token_index is not None and char_index is not None:
+        raise typer.BadParameter("Provide at most one of --token-index or --char-index.")
+
+    comparison: ComparisonResult = compare_model_names(
+        model_a,
+        model_b,
+        text,
+        token_index=-1 if token_index is None else token_index,
+        char_index=char_index,
+        top_k=top_k,
+        target_token=target_token,
+        keep_log_probs=kl,
+        sequential=not concurrent,
+        factory=lambda name: _build_analyzer(name, device, dtype, lens_mode, trust_remote_code),
+    )
+
+    typer.echo(format_model_comparison_header(comparison))
+    typer.echo("")
+    typer.echo(format_comparison(comparison, kl_threshold=kl_threshold))
+
+    if json_path is not None:
+        comparison.save_json(json_path)
+        typer.echo(f"Saved JSON to {json_path}")
+    if html_path is not None:
+        from .visualization.comparison import export_comparison_html
+
+        export_comparison_html(comparison, html_path)
+        typer.echo(f"Saved comparison chart to {html_path}")
+
+
+@app.command("compare-results")
+def compare_results_cmd(
+    result_a_path: Path = typer.Argument(
+        ..., help="First LogitLensResult JSON (written by `analyze --json`)."
+    ),
+    result_b_path: Path = typer.Argument(
+        ..., help="Second LogitLensResult JSON (written by `analyze --json`)."
+    ),
+    kl_threshold: float = typer.Option(
+        0.1, "--kl-threshold", help="Footer threshold (always 'no distributions', see below)."
+    ),
+    json_path: Path | None = typer.Option(
+        None, "--json", help="Write the full ComparisonResult as JSON."
+    ),
+    html_path: Path | None = typer.Option(
+        None, "--html", help="Write a KL/JS-by-layer chart (plotly; no KL/JS traces, see below)."
+    ),
+) -> None:
+    """Compare two saved `analyze --json` results without loading either model.
+
+    KL/JS require full-vocabulary log-probabilities, which are not part of the saved
+    result JSON, so they are always unavailable here ('no distributions' in the
+    footer/chart) -- use `compare-models` against live models for KL/JS. Layers are
+    aligned by relative depth when the two results have different layer counts;
+    comparison is by decoded token text (kind="model") when the two results' model
+    names differ, by token id (kind="prompt") otherwise.
+    """
+    result_a = LogitLensResult.load_json(result_a_path)
+    result_b = LogitLensResult.load_json(result_b_path)
+
+    same_model = result_a.model_name == result_b.model_name
+    kind = "prompt" if same_model else "model"
+    compare_by = "token_id" if same_model else "text"
+    alignment = align_layers(result_a.num_layers, result_b.num_layers)
+
+    comparison = compare_results(
+        result_a,
+        result_b,
+        alignment=alignment,
+        compare_by=compare_by,
+        kind=kind,
+        metadata={
+            "model_a": result_a.model_name,
+            "model_b": result_b.model_name,
+            "same_vocab": same_model,
+            "source": "compare-results (no model loaded, no distributions)",
+        },
+    )
+
+    if kind == "model":
+        typer.echo(format_model_comparison_header(comparison))
+    else:
+        typer.echo(f"Model: {result_a.model_name}  (lens={result_a.lens_mode.value})")
+        typer.echo(
+            f"A: analyzed {_display(result_a.analyzed_token)} at index {result_a.token_index}"
+        )
+        typer.echo(
+            f"B: analyzed {_display(result_b.analyzed_token)} at index {result_b.token_index}"
+        )
     typer.echo("")
     typer.echo(format_comparison(comparison, kl_threshold=kl_threshold))
 
