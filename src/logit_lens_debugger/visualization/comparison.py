@@ -38,10 +38,14 @@ def format_model_comparison_header(cmp: ComparisonResult) -> str:
         f"B: {b.model_name}  ({b.num_layers} layers, token_index={b.token_index}, "
         f"analyzed {display_token(b.analyzed_token)})",
     ]
-    if cmp.metadata.get("same_vocab"):
+    same_vocab = cmp.metadata.get("same_vocab")
+    if same_vocab is True:
         lines.append("vocab: identical (KL/JS available)")
-    else:
+    elif same_vocab is False:
         lines.append("vocab: different (compared by decoded text; KL/JS n/a)")
+    else:
+        # e.g. `compare-results`: two saved JSONs, the vocabularies were never inspected.
+        lines.append("vocab: unknown (compared by decoded text; KL/JS n/a)")
     return "\n".join(lines)
 
 

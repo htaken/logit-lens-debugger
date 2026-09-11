@@ -354,7 +354,8 @@ def compare_results_cmd(
         metadata={
             "model_a": result_a.model_name,
             "model_b": result_b.model_name,
-            "same_vocab": same_model,
+            # Saved results carry no vocabulary; only a same-name pair is known to match.
+            "same_vocab": True if same_model else None,
             "source": "compare-results (no model loaded, no distributions)",
         },
     )

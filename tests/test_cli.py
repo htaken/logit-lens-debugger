@@ -283,8 +283,11 @@ def test_compare_results_command(patched_cli_two_models, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert "no distributions" in result.output
+    # Saved results carry no vocabulary, so the header must not claim they differ.
+    assert "vocab: unknown" in result.output
     payload = json.loads(out_json.read_text(encoding="utf-8"))
     assert payload["kind"] == "model"
+    assert payload["metadata"]["same_vocab"] is None
 
 
 def test_compare_results_command_html(patched_cli_two_models, tmp_path):
