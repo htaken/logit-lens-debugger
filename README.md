@@ -735,7 +735,7 @@ uv run ruff check src tests examples && uv run ruff format --check src tests exa
 3. ~~Layer instability スコア~~ → 実装済み（`metrics.py`）
 4. ~~Prompt comparison の拡張~~ → 実装済み（`comparison.py`、`analyzer.compare()` に `token_index_b` / KL・JS / top-k overlap / target rank 差、CLI `compare` の拡張オプション）
 5. ~~Model comparison~~ → 実装済み（`analyzer.compare_models()` / `compare_model_names()`、`comparison.align_layers()` / `vocab_identical()`、CLI `compare-models` / `compare-results` コマンド）
-6. **chat template オプション**、**tuned lens**、**batch 対応**。
+6. **chat template オプション**（[#1](https://github.com/htaken/logit-lens-debugger/issues/1)）、**tuned lens**（[#2](https://github.com/htaken/logit-lens-debugger/issues/2)）、**batch 対応**（[#3](https://github.com/htaken/logit-lens-debugger/issues/3)）。着手の条件と要件は各 issue を参照。
 
 ## 参考
 
